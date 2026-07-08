@@ -388,46 +388,133 @@ temporal workflow list -q 'userId="user-001" AND subscriptionType="BILL"'
 
 ## Verificar que Funciona
 
-### Test básico (happy path + retry + re-enqueue)
+### Flujo 1: Happy Path (cobro exitoso + re-enqueue)
 
 ```bash
-# 1. Crear subscription
+# Crear subscription BILL
 curl -s -X POST http://localhost:3000/subscriptions \
   -H "Content-Type: application/json" \
-  -d '{"userId":"user-001","subscriptionType":"BILL","destinationId":"biller-electricity","amount":120.50}' | jq .
+  -d '{"userId":"user-001","subscriptionType":"BILL","destinationId":"biller-claro","amount":89.90}' | jq .
 
-# 2. Esperar ~15 seg y verificar:
-curl -s http://localhost:3000/outbox | jq '.[].event_type'
-# Debería mostrar: "PAYMENT_SUCCEEDED" (o "ATTEMPT_FAILED" + retry)
+# Esperar 15 segundos y verificar resultado
+sleep 15
 
-# 3. Verificar re-encolamiento:
-curl -s http://localhost:3000/queue | jq '.[] | {status, due_at}'
-# Debería mostrar: DONE (hoy) + READY (mañana)
+# ¿Se cobró? Debe mostrar PAYMENT_SUCCEEDED
+curl -s http://localhost:3000/outbox | jq '.[] | select(.event_type | contains("PAYMENT")) | {event_type, subscription_id}'
+
+# ¿Se re-encoló para mañana? Debe mostrar un row READY con due_at de mañana
+curl -s http://localhost:3000/queue | jq '.[] | {status, due_at}' | head -10
 ```
 
-### Test de cancelación en vuelo
+**Qué esperar:**
+- En la terminal del Bill Worker: `[BillPayment] Attempt 1/3 → SUCCESS ✅`
+- En la terminal del Outbox Consumer: `📤 [PAYMENT_SUCCEEDED] → kafka://payments.events`
+- Si falló el primer intento (20% probabilidad): verás `ATTEMPT_FAILED` + sleep 1 min + reintento
+
+---
+
+### Flujo 2: P2P (transferencia wallet-to-wallet)
 
 ```bash
-# 1. Crear subscription (ejecuta en 10 seg)
-RESPONSE=$(curl -s -X POST http://localhost:3000/subscriptions \
+# Crear subscription P2P
+curl -s -X POST http://localhost:3000/subscriptions \
   -H "Content-Type: application/json" \
-  -d '{"subscriptionType":"BILL","destinationId":"biller-test","amount":100}')
-SUB_ID=$(echo $RESPONSE | jq -r '.id')
+  -d '{"userId":"user-002","subscriptionType":"P2P","destinationId":"wallet-mama","amount":200.00}' | jq .
 
-# 2. Esperar a que falle el primer intento (~15 seg)
-# 3. Cancelar mientras está en sleep de retry:
-curl -s -X PATCH http://localhost:3000/subscriptions/$SUB_ID/cancel | jq .
+sleep 15
 
-# 4. Verificar en logs: "[BillPayment] 🚫 Cancelled during attempt 1"
+# Verificar — debe aparecer en el P2P Worker (no en el Bill Worker)
+curl -s http://localhost:3000/outbox | jq '.[-1] | {event_type, subscription_id}'
 ```
+
+**Qué esperar:**
+- Terminal P2P Worker: `[P2P] validateP2PRecipient → ACTIVE` + `executeP2PTransfer → SUCCESS`
+- Terminal Bill Worker: **nada** (confirma que task queues están aisladas)
+
+---
+
+### Flujo 3: Cancelar mid-flight
+
+```bash
+# Crear subscription
+SUB_ID=$(curl -s -X POST http://localhost:3000/subscriptions \
+  -H "Content-Type: application/json" \
+  -d '{"subscriptionType":"BILL","destinationId":"biller-test","amount":100}' | jq -r '.id')
+
+echo "Subscription: $SUB_ID"
+
+# Esperar a que arranque el workflow (12 seg)
+sleep 12
+
+# Cancelar
+curl -s -X PATCH "http://localhost:3000/subscriptions/$SUB_ID/cancel" | jq .
+```
+
+**Qué esperar:**
+- Si el workflow estaba en retry-sleep: Bill Worker muestra `🚫 Cancelled during attempt X`
+- Si ya había terminado: responde "No active workflow to cancel" (idempotente)
+
+---
+
+### Flujo 4: Signal + Query (cambiar monto y consultar estado)
+
+```bash
+# Crear varias subscriptions (alguna fallará y entrará en retry-sleep)
+for i in 1 2 3 4 5; do
+  curl -s -X POST http://localhost:3000/subscriptions \
+    -H "Content-Type: application/json" \
+    -d "{\"userId\":\"user-signal\",\"subscriptionType\":\"BILL\",\"destinationId\":\"biller-$i\",\"amount\":$((i*20))}" > /dev/null
+done
+echo "Creadas 5 subscriptions"
+
+sleep 15
+
+# Buscar un workflow que esté en retry (Running)
+curl -s "http://localhost:3000/workflows/search?status=Running" | jq '.workflows[0].workflowId'
+
+# Si hay uno corriendo, usa su ID para:
+# Query: ver en qué intento va
+curl -s "http://localhost:3000/workflows/{WORKFLOW_ID}/query/progress" | jq .
+
+# Signal: cambiar el monto a 1.00
+curl -s -X POST "http://localhost:3000/workflows/{WORKFLOW_ID}/signal/updateAmount" \
+  -H "Content-Type: application/json" \
+  -d '{"amount": 1.00}' | jq .
+
+# Query de nuevo: confirmar que cambió
+curl -s "http://localhost:3000/workflows/{WORKFLOW_ID}/query/progress" | jq .
+```
+
+**Qué esperar:**
+- Query muestra: `{ currentAttempt: 1, maxAttempts: 3, currentAmount: 50, status: "WAITING_RETRY" }`
+- Después del signal: `currentAmount` cambia a `1.00`
+- Cuando el timer expire, el Bill Worker cobrará con el nuevo monto
+
+---
+
+### Flujo 5: Search Attributes
+
+```bash
+# Buscar todos los workflows de un usuario
+curl -s "http://localhost:3000/workflows/search?userId=user-001" | jq '.count, .workflows[].workflowId'
+
+# Buscar por tipo
+curl -s "http://localhost:3000/workflows/search?subscriptionType=P2P" | jq '.count'
+
+# También desde Temporal CLI:
+temporal workflow list -q 'userId="user-001"'
+temporal workflow list -q 'subscriptionType="P2P" AND ExecutionStatus="Running"'
+```
+
+---
 
 ### Temporal UI
 
-Navega a http://localhost:8233 para ver:
-- Historial completo de cada workflow
-- Timers activos (sleep entre reintentos)
+Abre http://localhost:8233 para ver:
+- Historial completo de cada workflow (activities, timers, signals)
 - Child workflows y su relación con el parent
-- Workflows cancelados
+- Search Attributes como filtros
+- Workflows cancelados vs completados
 
 ---
 
