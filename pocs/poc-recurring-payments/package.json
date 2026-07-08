@@ -12,7 +12,6 @@
     "start:worker:bill": "ts-node src/workers/bill.worker.ts",
     "start:worker:p2p": "ts-node src/workers/p2p.worker.ts",
     "start:outbox": "ts-node src/outbox/consumer.ts",
-    "demo": "ts-node src/scripts/demo.ts",
     "test:create": "ts-node src/scripts/create-subscription.ts"
   },
   "dependencies": {
