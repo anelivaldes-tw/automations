@@ -2,23 +2,35 @@
 
 Proof of Concept que valida la arquitectura de pagos recurrentes automatizados usando **Temporal** como orquestador de workflows.
 
+### ¿Qué problema resuelve?
+
+En Yape tenemos múltiples tipos de pagos recurrentes (servicios, P2P, top-ups) que hoy se ejecutan con cron jobs aislados. Esta PoC valida una **arquitectura unificada** que:
+
+- Orquesta pagos con reintentos durables (sobreviven crashes)
+- Escala cada tipo de pago de forma independiente
+- Notifica al usuario en cada fallo intermedio
+- Permite cancelar un cobro en curso inmediatamente
+- Re-encola la siguiente ejecución de forma atómica
+
+**Audiencia:** Equipo de desarrollo de Yape — para validar patrones antes de implementar en producción.
+
 ## Tabla de Contenidos
 
 - [Arquitectura General](#arquitectura-general)
 - [Flujo de Ejecución Detallado](#flujo-de-ejecución-detallado)
 - [Patrones Arquitectónicos Validados](#patrones-arquitectónicos-validados)
-- [Prerequisitos](#prerequisitos)
 - [Quick Start](#quick-start)
-- [API — Endpoints y Curls](#api--endpoints-y-curls)
 - [Verificar que Funciona](#verificar-que-funciona)
+- [API — Endpoints y Curls](#api--endpoints-y-curls)
 - [Estructura del Proyecto](#estructura-del-proyecto)
 - [Modelo de Datos](#modelo-de-datos)
 - [Configuración](#configuración)
-- [Notas de Producción vs PoC](#notas-de-producción-vs-poc)
 - [Signals, Queries y Search Attributes](#signals-queries-y-search-attributes)
 - [Outbox Consumer](#outbox-consumer)
 - [Comunicación entre Servicios](#comunicación-entre-servicios)
+- [Notas de Producción vs PoC](#notas-de-producción-vs-poc)
 - [Decisiones Arquitectónicas Abiertas](#decisiones-arquitectónicas-abiertas)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -278,132 +290,6 @@ npm run test:create
 
 ---
 
-## API — Endpoints y Curls
-
-### Crear una subscription
-
-```bash
-curl -X POST http://localhost:3000/subscriptions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "userId": "user-001",
-    "subscriptionType": "BILL",
-    "destinationId": "biller-electricity",
-    "amount": 120.50,
-    "frequency": "DAILY"
-  }'
-```
-
-Respuesta:
-```json
-{
-  "id": "43a05e07-a7cc-4f5a-b774-fb512457a14b",
-  "nextExecution": "2026-07-08T19:28:39.546Z"
-}
-```
-
-### Cancelar una subscription
-
-```bash
-curl -X PATCH http://localhost:3000/subscriptions/43a05e07-a7cc-4f5a-b774-fb512457a14b/cancel
-```
-
-Respuesta:
-```json
-{
-  "id": "43a05e07-a7cc-4f5a-b774-fb512457a14b",
-  "status": "INACTIVE",
-  "message": "Subscription cancelled"
-}
-```
-
-> **Nota:** Si hay un workflow en ejecución (ej: en sleep de retry), se cancela inmediatamente vía Temporal.
-
-### Listar subscripciones
-
-```bash
-curl http://localhost:3000/subscriptions | jq
-```
-
-### Ver cola de ejecución
-
-```bash
-curl http://localhost:3000/queue | jq
-```
-
-### Ver outbox de notificaciones
-
-```bash
-curl http://localhost:3000/outbox | jq
-```
-
-### Crear subscription P2P (transferencia entre wallets)
-
-```bash
-curl -X POST http://localhost:3000/subscriptions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "userId": "user-002",
-    "subscriptionType": "P2P",
-    "destinationId": "wallet-mama",
-    "amount": 200.00,
-    "frequency": "DAILY"
-  }'
-```
-
-### Signal: Cambiar monto mid-flight
-
-Cuando un workflow está en retry-sleep, puedes cambiar el monto que usará en el próximo intento:
-
-```bash
-# El workflowId del child es: {subscriptionId}-{date}-BILL
-curl -X POST http://localhost:3000/workflows/{subscriptionId}-2026-07-08-BILL/signal/updateAmount \
-  -H "Content-Type: application/json" \
-  -d '{"amount": 75.00}'
-```
-
-### Query: Inspeccionar progreso del child workflow
-
-```bash
-# Ver en qué intento va, monto actual, y si está esperando retry
-curl http://localhost:3000/workflows/{subscriptionId}-2026-07-08-BILL/query/progress | jq
-```
-
-Respuesta:
-```json
-{
-  "currentAttempt": 2,
-  "maxAttempts": 3,
-  "currentAmount": 75.00,
-  "status": "WAITING_RETRY",
-  "lastAttemptResult": "FAILED"
-}
-```
-
-### Query: Estado del parent workflow
-
-```bash
-curl http://localhost:3000/workflows/recurring-{subscriptionId}-2026-07-08/query/status | jq
-```
-
-### Search: Buscar workflows por atributos
-
-```bash
-# Buscar todos los workflows de un usuario
-curl "http://localhost:3000/workflows/search?userId=user-001" | jq
-
-# Buscar por tipo de pago
-curl "http://localhost:3000/workflows/search?subscriptionType=P2P" | jq
-
-# Buscar por estado
-curl "http://localhost:3000/workflows/search?status=Running" | jq
-
-# También funciona directamente con Temporal CLI:
-temporal workflow list -q 'userId="user-001" AND subscriptionType="BILL"'
-```
-
----
-
 ## Verificar que Funciona
 
 ### Flujo 1: Happy Path (cobro exitoso + re-enqueue)
@@ -535,6 +421,134 @@ Abre http://localhost:8233 para ver:
 - Workflows cancelados vs completados
 
 ---
+
+---
+
+## API — Endpoints y Curls
+
+### Crear una subscription
+
+```bash
+curl -X POST http://localhost:3000/subscriptions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "userId": "user-001",
+    "subscriptionType": "BILL",
+    "destinationId": "biller-electricity",
+    "amount": 120.50,
+    "frequency": "DAILY"
+  }'
+```
+
+Respuesta:
+```json
+{
+  "id": "43a05e07-a7cc-4f5a-b774-fb512457a14b",
+  "nextExecution": "2026-07-08T19:28:39.546Z"
+}
+```
+
+### Cancelar una subscription
+
+```bash
+curl -X PATCH http://localhost:3000/subscriptions/43a05e07-a7cc-4f5a-b774-fb512457a14b/cancel
+```
+
+Respuesta:
+```json
+{
+  "id": "43a05e07-a7cc-4f5a-b774-fb512457a14b",
+  "status": "INACTIVE",
+  "message": "Subscription cancelled"
+}
+```
+
+> **Nota:** Si hay un workflow en ejecución (ej: en sleep de retry), se cancela inmediatamente vía Temporal.
+
+### Listar subscripciones
+
+```bash
+curl http://localhost:3000/subscriptions | jq
+```
+
+### Ver cola de ejecución
+
+```bash
+curl http://localhost:3000/queue | jq
+```
+
+### Ver outbox de notificaciones
+
+```bash
+curl http://localhost:3000/outbox | jq
+```
+
+### Crear subscription P2P (transferencia entre wallets)
+
+```bash
+curl -X POST http://localhost:3000/subscriptions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "userId": "user-002",
+    "subscriptionType": "P2P",
+    "destinationId": "wallet-mama",
+    "amount": 200.00,
+    "frequency": "DAILY"
+  }'
+```
+
+### Signal: Cambiar monto mid-flight
+
+Cuando un workflow está en retry-sleep, puedes cambiar el monto que usará en el próximo intento:
+
+```bash
+# El workflowId del child es: {subscriptionId}-{date}-BILL
+curl -X POST http://localhost:3000/workflows/{subscriptionId}-2026-07-08-BILL/signal/updateAmount \
+  -H "Content-Type: application/json" \
+  -d '{"amount": 75.00}'
+```
+
+### Query: Inspeccionar progreso del child workflow
+
+```bash
+# Ver en qué intento va, monto actual, y si está esperando retry
+curl http://localhost:3000/workflows/{subscriptionId}-2026-07-08-BILL/query/progress | jq
+```
+
+Respuesta:
+```json
+{
+  "currentAttempt": 2,
+  "maxAttempts": 3,
+  "currentAmount": 75.00,
+  "status": "WAITING_RETRY",
+  "lastAttemptResult": "FAILED"
+}
+```
+
+### Query: Estado del parent workflow
+
+```bash
+curl http://localhost:3000/workflows/recurring-{subscriptionId}-2026-07-08/query/status | jq
+```
+
+### Search: Buscar workflows por atributos
+
+```bash
+# Buscar todos los workflows de un usuario
+curl "http://localhost:3000/workflows/search?userId=user-001" | jq
+
+# Buscar por tipo de pago
+curl "http://localhost:3000/workflows/search?subscriptionType=P2P" | jq
+
+# Buscar por estado
+curl "http://localhost:3000/workflows/search?status=Running" | jq
+
+# También funciona directamente con Temporal CLI:
+temporal workflow list -q 'userId="user-001" AND subscriptionType="BILL"'
+```
+
+
 
 ## Estructura del Proyecto
 
@@ -830,3 +844,18 @@ Se pueden combinar: retry rápido en child (horas) + re-enqueue externo (días).
 | **A) Proceso standalone + SKIP LOCKED** | Múltiples instancias del scheduler pueden correr en paralelo sin duplicar trabajo |
 | **B) Temporal Schedules** | Feature nativo de Temporal para scheduling (evaluar si soporta batching) |
 | **C) Kubernetes CronJob** | Familiar, pero menos control |
+
+---
+
+## Troubleshooting
+
+| Problema | Causa | Solución |
+|----------|-------|----------|
+| Workers muestran `gRPC Unavailable` | Temporal server no está corriendo | Ejecuta `temporal server start-dev --ui-port 8233 --db-filename temporal_poc.db` |
+| `ECONNREFUSED :5433` | PostgreSQL no está corriendo | Ejecuta `docker-compose up -d` |
+| Scheduler no detecta subscriptions | La `due_at` aún no venció | Espera 10 segundos después de crear la subscription |
+| Signal/Query devuelve 404 | El workflow ya terminó | Crea más subscriptions para tener uno en retry-sleep |
+| `ALREADY_EXISTS` en scheduler | Workflow ya fue creado para ese día | Correcto — el scheduler lo maneja como idempotente (skip) |
+| `WorkflowTaskFailed` (non-determinism) | Cambiaste código de un workflow con ejecuciones activas | Termina los workflows viejos: `temporal workflow terminate --workflow-id X` |
+| Outbox consumer no muestra eventos | Los workflows aún no escribieron al outbox | Espera a que un workflow complete (éxito o fallo) |
+| P2P workflow no ejecuta | P2P Worker no está corriendo | Levanta `npm run start:worker:p2p` |
