@@ -1,8 +1,19 @@
 import express from 'express';
+import { Connection, Client } from '@temporalio/client';
 import { pool } from '../db/pool';
 
 const app = express();
 app.use(express.json());
+
+// Shared Temporal client (lazy-initialized)
+let temporalClient: Client | null = null;
+async function getTemporalClient(): Promise<Client> {
+  if (!temporalClient) {
+    const connection = await Connection.connect({ address: 'localhost:7233' });
+    temporalClient = new Client({ connection });
+  }
+  return temporalClient;
+}
 
 // POST /subscriptions — Create a recurring payment subscription
 app.post('/subscriptions', async (req, res) => {
@@ -66,9 +77,7 @@ app.patch('/subscriptions/:id/cancel', async (req, res) => {
     );
 
     // Cancel any running workflow for this subscription via Temporal
-    const { Connection, Client } = await import('@temporalio/client');
-    const connection = await Connection.connect({ address: 'localhost:7233' });
-    const client = new Client({ connection });
+    const client = await getTemporalClient();
 
     // Find and cancel active workflows for this subscription
     const today = new Date().toISOString().split('T')[0];
@@ -145,9 +154,7 @@ app.post('/workflows/:workflowId/signal/updateAmount', async (req, res) => {
   const { amount } = req.body;
 
   try {
-    const { Connection, Client } = await import('@temporalio/client');
-    const connection = await Connection.connect({ address: 'localhost:7233' });
-    const client = new Client({ connection });
+    const client = await getTemporalClient();
 
     const handle = client.workflow.getHandle(workflowId);
     await handle.signal('updateAmount', amount);
@@ -165,9 +172,7 @@ app.get('/workflows/:workflowId/query/progress', async (req, res) => {
   const { workflowId } = req.params;
 
   try {
-    const { Connection, Client } = await import('@temporalio/client');
-    const connection = await Connection.connect({ address: 'localhost:7233' });
-    const client = new Client({ connection });
+    const client = await getTemporalClient();
 
     const handle = client.workflow.getHandle(workflowId);
     const progress = await handle.query('getProgress');
@@ -184,9 +189,7 @@ app.get('/workflows/:workflowId/query/status', async (req, res) => {
   const { workflowId } = req.params;
 
   try {
-    const { Connection, Client } = await import('@temporalio/client');
-    const connection = await Connection.connect({ address: 'localhost:7233' });
-    const client = new Client({ connection });
+    const client = await getTemporalClient();
 
     const handle = client.workflow.getHandle(workflowId);
     const status = await handle.query('getExecutionStatus');
@@ -203,9 +206,7 @@ app.get('/workflows/search', async (req, res) => {
   const { userId, subscriptionType, status } = req.query;
 
   try {
-    const { Connection, Client } = await import('@temporalio/client');
-    const connection = await Connection.connect({ address: 'localhost:7233' });
-    const client = new Client({ connection });
+    const client = await getTemporalClient();
 
     // Build query from search attributes
     const conditions: string[] = [];
@@ -221,7 +222,7 @@ app.get('/workflows/search', async (req, res) => {
       workflows.push({
         workflowId: wf.workflowId,
         type: wf.type,
-        status: wf.status.name,
+        status: wf.status?.name || String(wf.status),
         startTime: wf.startTime,
         searchAttributes: wf.searchAttributes,
       });
@@ -235,6 +236,11 @@ app.get('/workflows/search', async (req, res) => {
   }
 });
 
+// Prevent unhandled rejections from crashing the process
+process.on('unhandledRejection', (err: any) => {
+  console.error('⚠️ Unhandled rejection:', err?.message || err);
+});
+
 const PORT = 3000;
 app.listen(PORT, () => {
   console.log(`🚀 API server running on http://localhost:${PORT}`);
@@ -242,4 +248,8 @@ app.listen(PORT, () => {
   console.log(`   GET  /subscriptions  — list all`);
   console.log(`   GET  /queue          — see execution queue`);
   console.log(`   GET  /outbox         — see notifications`);
+  console.log(`   POST /workflows/:id/signal/updateAmount`);
+  console.log(`   GET  /workflows/:id/query/progress`);
+  console.log(`   GET  /workflows/:id/query/status`);
+  console.log(`   GET  /workflows/search?userId=X&subscriptionType=Y`);
 });

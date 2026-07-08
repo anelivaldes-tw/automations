@@ -11,6 +11,9 @@ flowchart TD
     subgraph API["API Server (:3000)"]
         POST[POST /subscriptions]
         CANCEL[PATCH /subscriptions/:id/cancel]
+        SIGNAL[POST /workflows/:id/signal/updateAmount]
+        QUERY[GET /workflows/:id/query/progress]
+        SEARCH[GET /workflows/search]
     end
 
     subgraph DB["PostgreSQL (:5433)"]
@@ -20,13 +23,19 @@ flowchart TD
     end
 
     subgraph TEMPORAL["Temporal Server (:7233)"]
-        WF_P[recurringPaymentWorkflow]
-        WF_C[billPaymentWorkflow]
+        WF_P[recurringPaymentWorkflow<br/>+ Search Attributes]
+        WF_BILL[billPaymentWorkflow<br/>+ Signal + Query]
+        WF_P2P[p2pPaymentWorkflow]
     end
 
     subgraph WORKERS["Workers"]
         W_PLAT[Platform Worker<br/>task queue: payments-platform]
         W_BILL[Bill Worker<br/>task queue: payments-bill]
+        W_P2P[P2P Worker<br/>task queue: payments-p2p]
+    end
+
+    subgraph OUTBOX_CONSUMER["Outbox Consumer"]
+        OC[Polling consumer<br/>→ simulated Kafka publish]
     end
 
     POST -->|"TX atómica"| SUBS
@@ -36,15 +45,22 @@ flowchart TD
     CANCEL -->|"status=INACTIVE"| SUBS
     CANCEL -->|"workflow.cancel()"| TEMPORAL
 
+    SIGNAL -->|"signal: updateAmount"| WF_BILL
+    QUERY -->|"query: getProgress"| WF_BILL
+    SEARCH -->|"Search Attributes"| TEMPORAL
+
     SCH[Scheduler<br/>polling 3s] -->|"claim READY rows<br/>+ JOIN subscriptions"| QUEUE
     SCH -->|"startWorkflow<br/>(timeout: 4 days)"| WF_P
 
-    WF_P -->|"executeChild<br/>(cancellationType: WAIT)"| WF_C
+    WF_P -->|"executeChild(BILL)<br/>task queue: payments-bill"| WF_BILL
+    WF_P -->|"executeChild(P2P)<br/>task queue: payments-p2p"| WF_P2P
     W_PLAT -.->|"ejecuta"| WF_P
-    W_BILL -.->|"ejecuta"| WF_C
+    W_BILL -.->|"ejecuta"| WF_BILL
+    W_P2P -.->|"ejecuta"| WF_P2P
 
     WF_P -->|"recordPaymentResult<br/>(TX atómica + re-enqueue)"| DB
-    WF_C -->|"notifyAttemptFailed"| OUTBOX
+    WF_BILL -->|"notifyAttemptFailed<br/>(HTTP → platform API)"| OUTBOX
+    OC -->|"poll PENDING → mark PUBLISHED"| OUTBOX
 ```
 
 ---
@@ -187,11 +203,16 @@ El `sleep()` de Temporal es **cancellation-aware**: cuando se cancela el workflo
 | **Transactional Outbox** | Notificaciones se escriben en la misma TX que el resultado del pago |
 | **Idempotency** | Workflow IDs determinísticos (`{sub_id}-{date}-{type}`) evitan duplicados |
 | **Durable Timers** | `sleep('1 day')` en Temporal sobrevive crashes y reinicios |
-| **Separation of Concerns** | Task queues separadas por dominio (platform vs bill) |
+| **Separation of Concerns** | Task queues separadas por dominio (platform / bill / p2p) |
 | **Retry con notificación** | Cada fallo intermedio notifica al usuario vía outbox antes del retry |
 | **Re-encolamiento atómico** | Próxima ejecución se inserta en la misma TX que el resultado |
 | **Cancellation-aware** | Child workflow detecta cancelación con `isCancellation()` y termina limpiamente |
 | **Configurable retries** | `max_retries` se lee de BD, no hardcodeado en el workflow |
+| **Signals** | `updateAmount` permite cambiar el monto de cobro mientras el workflow está en retry-sleep |
+| **Queries** | `getProgress` inspecciona el estado del child sin bloquearlo (attempt, amount, status) |
+| **Search Attributes** | `userId` + `subscriptionType` permiten buscar workflows en Temporal UI/API |
+| **Outbox Consumer** | Polling → publicación simulada a Kafka con routing por event_type |
+| **Multi-strategy children** | BILL (cobro a biller) y P2P (transferencia wallet-to-wallet) como workflows separados |
 | **Scheduler recovery** | Rows stuck en PROCESSING >5 min se liberan automáticamente |
 | **Workflow timeout** | `workflowExecutionTimeout: '4 days'` previene workflows zombie |
 | **Suspension** | Subscription se suspende tras agotar max_retries definitivamente |
@@ -221,13 +242,19 @@ temporal server start-dev --ui-port 8233 --db-filename temporal_poc.db
 # 4. Crear schema de BD
 npm run db:setup
 
-# 5. Levantar workers y servicios (cada uno en una terminal)
-npm run start:worker:platform   # Terminal 1 — Platform Worker
-npm run start:worker:bill       # Terminal 2 — Bill Worker
-npm run start:scheduler         # Terminal 3 — Scheduler (polling)
-npm run start:api               # Terminal 4 — API REST
+# 5. Registrar Search Attributes en Temporal
+chmod +x scripts/register-search-attributes.sh
+./scripts/register-search-attributes.sh
 
-# 6. Crear subscripciones de prueba
+# 6. Levantar workers y servicios (cada uno en una terminal)
+npm run start:worker:platform   # Terminal 1 — Platform Worker (task queue: payments-platform)
+npm run start:worker:bill       # Terminal 2 — Bill Worker (task queue: payments-bill)
+npm run start:worker:p2p        # Terminal 3 — P2P Worker (task queue: payments-p2p)
+npm run start:scheduler         # Terminal 4 — Scheduler (polling)
+npm run start:api               # Terminal 5 — API REST
+npm run start:outbox            # Terminal 6 — Outbox Consumer
+
+# 7. Crear subscripciones de prueba
 npm run test:create
 ```
 
@@ -292,6 +319,71 @@ curl http://localhost:3000/queue | jq
 curl http://localhost:3000/outbox | jq
 ```
 
+### Crear subscription P2P (transferencia entre wallets)
+
+```bash
+curl -X POST http://localhost:3000/subscriptions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "userId": "user-002",
+    "subscriptionType": "P2P",
+    "destinationId": "wallet-mama",
+    "amount": 200.00,
+    "frequency": "DAILY"
+  }'
+```
+
+### Signal: Cambiar monto mid-flight
+
+Cuando un workflow está en retry-sleep, puedes cambiar el monto que usará en el próximo intento:
+
+```bash
+# El workflowId del child es: {subscriptionId}-{date}-BILL
+curl -X POST http://localhost:3000/workflows/{subscriptionId}-2026-07-08-BILL/signal/updateAmount \
+  -H "Content-Type: application/json" \
+  -d '{"amount": 75.00}'
+```
+
+### Query: Inspeccionar progreso del child workflow
+
+```bash
+# Ver en qué intento va, monto actual, y si está esperando retry
+curl http://localhost:3000/workflows/{subscriptionId}-2026-07-08-BILL/query/progress | jq
+```
+
+Respuesta:
+```json
+{
+  "currentAttempt": 2,
+  "maxAttempts": 3,
+  "currentAmount": 75.00,
+  "status": "WAITING_RETRY",
+  "lastAttemptResult": "FAILED"
+}
+```
+
+### Query: Estado del parent workflow
+
+```bash
+curl http://localhost:3000/workflows/recurring-{subscriptionId}-2026-07-08/query/status | jq
+```
+
+### Search: Buscar workflows por atributos
+
+```bash
+# Buscar todos los workflows de un usuario
+curl "http://localhost:3000/workflows/search?userId=user-001" | jq
+
+# Buscar por tipo de pago
+curl "http://localhost:3000/workflows/search?subscriptionType=P2P" | jq
+
+# Buscar por estado
+curl "http://localhost:3000/workflows/search?status=Running" | jq
+
+# También funciona directamente con Temporal CLI:
+temporal workflow list -q 'userId="user-001" AND subscriptionType="BILL"'
+```
+
 ---
 
 ## Verificar que Funciona
@@ -344,25 +436,33 @@ Navega a http://localhost:8233 para ver:
 ```
 src/
 ├── api/
-│   └── server.ts              # Express API — CRUD subscriptions + cancel
+│   └── server.ts              # Express API — CRUD + cancel + signals + queries + search
 ├── activities/
 │   └── index.ts               # Activities: validateSubscription, recordPaymentResult,
-│                              #   scheduleRetry, notifyAttemptFailed, validateBiller, executeCharge
+│                              #   scheduleRetry, notifyAttemptFailed, validateBiller,
+│                              #   executeCharge, validateP2PRecipient, executeP2PTransfer
 ├── db/
 │   ├── pool.ts                # Conexión a PostgreSQL
 │   ├── schema.sql             # DDL: subscriptions, payment_execution_queue, notification_outbox
 │   └── setup.ts               # Script para crear el schema
+├── outbox/
+│   └── consumer.ts            # Outbox consumer — polling + simulated Kafka publish
 ├── scheduler/
 │   └── dispatcher.ts          # Poller: claim queue rows → start workflows + recovery
 ├── scripts/
 │   └── create-subscription.ts # Script para crear subscripciones de prueba
 ├── workers/
 │   ├── platform.worker.ts     # Worker: task queue 'payments-platform'
-│   └── bill.worker.ts         # Worker: task queue 'payments-bill'
+│   ├── bill.worker.ts         # Worker: task queue 'payments-bill'
+│   └── p2p.worker.ts          # Worker: task queue 'payments-p2p'
 └── workflows/
     ├── index.ts               # Exports de workflows
-    ├── recurring-payment.workflow.ts  # Parent: validate → strategy → child → record → re-enqueue
-    └── bill-payment.workflow.ts       # Child: validate biller → charge con reintentos + cancellation
+    ├── recurring-payment.workflow.ts  # Parent: validate → strategy → child → record
+    │                                  #   + Search Attributes + Query: getExecutionStatus
+    ├── bill-payment.workflow.ts       # Child BILL: charge con retries + Signal + Query
+    └── p2p-payment.workflow.ts        # Child P2P: wallet transfer con retries + cancellation
+scripts/
+└── register-search-attributes.sh    # Registra userId/subscriptionType en Temporal
 ```
 
 ---
@@ -436,6 +536,91 @@ Transactional outbox para notificaciones al usuario.
 | Cancelación | Via workflow ID del día | Via Search Attributes (buscar workflows activos por sub_id) |
 | max_retries | Configurable por subscription | Configurable por tipo + overrides por usuario |
 | Servicios | Monolito (todo en un proceso) | Microservicios separados por dominio |
+| Outbox consumer | Polling + console.log | CDC/Debezium → Kafka → N consumers |
+| Signals | Via API REST endpoint | Via Temporal client SDK directo |
+| Search Attributes | userId, subscriptionType | + customerId, billerId, amount range, region |
+
+---
+
+## Signals, Queries y Search Attributes
+
+### Signals — Modificar workflows en ejecución
+
+Los **Signals** permiten enviar datos a un workflow que está corriendo. El workflow los procesa de forma asíncrona:
+
+```mermaid
+sequenceDiagram
+    participant U as Soporte/Admin
+    participant API as API Server
+    participant T as Temporal
+    participant W as billPaymentWorkflow<br/>(sleeping 1 día)
+
+    U->>API: POST /workflows/:id/signal/updateAmount {amount: 75}
+    API->>T: handle.signal('updateAmount', 75)
+    T->>W: Signal delivered (async)
+    W->>W: currentAmount = 75
+    Note over W: Cuando despierte del sleep,<br/>usará el nuevo monto
+```
+
+**Caso de uso:** El usuario reporta que su factura cambió. Soporte ajusta el monto sin cancelar/recrear la subscription.
+
+### Queries — Inspeccionar workflows sin modificarlos
+
+Los **Queries** son lecturas sincrónicas del estado interno del workflow:
+
+```bash
+# ¿En qué intento va? ¿Cuánto va a cobrar?
+curl http://localhost:3000/workflows/{wfId}/query/progress
+# → { "currentAttempt": 2, "maxAttempts": 3, "currentAmount": 75, "status": "WAITING_RETRY" }
+```
+
+**Caso de uso:** Dashboard de ops muestra estado real-time de cada cobro sin consultar la BD.
+
+### Search Attributes — Buscar workflows masivamente
+
+Cada workflow publica `userId` y `subscriptionType` como Search Attributes indexados:
+
+```bash
+# "Dame todos los workflows activos del usuario X"
+temporal workflow list -q 'userId="user-001" AND ExecutionStatus="Running"'
+
+# "¿Cuántos cobros P2P se ejecutaron hoy?"
+temporal workflow list -q 'subscriptionType="P2P" AND StartTime > "2026-07-08"'
+```
+
+**Caso de uso:** Soporte busca "todos los pagos del usuario 12345" sin escanear la BD.
+
+---
+
+## Outbox Consumer
+
+El outbox consumer cierra el ciclo de eventos. Hace polling a `notification_outbox` y simula la publicación a Kafka:
+
+```bash
+npm run start:outbox
+```
+
+Output:
+```
+📬 Outbox Consumer started — polling every 2s
+  📤 [PAYMENT_SUCCEEDED] → kafka://payments.events → [ms-notifications (push), ms-analytics (metrics)]
+     subscription: df386204-8059-...
+     payload: {"result":"SUCCESS","attemptCount":1}
+     idempotency_key: df386204-...-PAYMENT_SUCCEEDED
+
+  📤 [ATTEMPT_FAILED] → kafka://payments.retries → [ms-notifications (push: "reintentaremos mañana")]
+     subscription: 63846306-702b-...
+     payload: {"attempt":1,"maxAttempts":3,"nextRetryIn":"1 day"}
+```
+
+### Routing por event_type
+
+| Event Type | Kafka Topic | Consumers |
+|-----------|-------------|-----------|
+| `PAYMENT_SUCCEEDED` | `payments.events` | ms-notifications (push), ms-analytics |
+| `PAYMENT_FAILED` | `payments.events` | ms-notifications (push+email), ms-support (alert) |
+| `ATTEMPT_FAILED` | `payments.retries` | ms-notifications (push: "reintentaremos mañana") |
+| `SUBSCRIPTION_SUSPENDED` | `subscriptions.lifecycle` | ms-notifications (email), ms-crm (churn risk) |
 
 ---
 
