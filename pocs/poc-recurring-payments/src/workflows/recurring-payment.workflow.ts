@@ -11,7 +11,7 @@ const { validateSubscription, recordPaymentResult, scheduleRetry } = proxyActivi
 // Strategy Resolver — maps subscription_type to child workflow + task queue
 const STRATEGY_MAP: Record<string, { workflowName: string; taskQueue: string }> = {
   BILL: { workflowName: 'billPaymentWorkflow', taskQueue: 'payments-bill' },
-  P2P:  { workflowName: 'p2pPaymentWorkflow', taskQueue: 'payments-bill' }, // same queue for PoC
+  P2P:  { workflowName: 'p2pPaymentWorkflow', taskQueue: 'payments-p2p' },
   MOCK: { workflowName: 'billPaymentWorkflow', taskQueue: 'payments-bill' },
 };
 
