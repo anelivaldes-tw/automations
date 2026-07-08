@@ -137,6 +137,104 @@ app.post('/internal/attempt-failed', async (req, res) => {
   }
 });
 
+// --- Signal & Query endpoints (interact with running workflows) ---
+
+// POST /workflows/:workflowId/signal/updateAmount — Send signal to change amount mid-flight
+app.post('/workflows/:workflowId/signal/updateAmount', async (req, res) => {
+  const { workflowId } = req.params;
+  const { amount } = req.body;
+
+  try {
+    const { Connection, Client } = await import('@temporalio/client');
+    const connection = await Connection.connect({ address: 'localhost:7233' });
+    const client = new Client({ connection });
+
+    const handle = client.workflow.getHandle(workflowId);
+    await handle.signal('updateAmount', amount);
+
+    console.log(`📡 Signal sent: ${workflowId} → updateAmount(${amount})`);
+    res.json({ ok: true, message: `Amount updated to ${amount} for workflow ${workflowId}` });
+  } catch (err: any) {
+    console.error(`Signal error:`, err.message);
+    res.status(404).json({ error: `Workflow not found or completed: ${err.message}` });
+  }
+});
+
+// GET /workflows/:workflowId/query/progress — Query child workflow progress
+app.get('/workflows/:workflowId/query/progress', async (req, res) => {
+  const { workflowId } = req.params;
+
+  try {
+    const { Connection, Client } = await import('@temporalio/client');
+    const connection = await Connection.connect({ address: 'localhost:7233' });
+    const client = new Client({ connection });
+
+    const handle = client.workflow.getHandle(workflowId);
+    const progress = await handle.query('getProgress');
+
+    res.json(progress);
+  } catch (err: any) {
+    console.error(`Query error:`, err.message);
+    res.status(404).json({ error: `Workflow not found or completed: ${err.message}` });
+  }
+});
+
+// GET /workflows/:workflowId/query/status — Query parent workflow execution status
+app.get('/workflows/:workflowId/query/status', async (req, res) => {
+  const { workflowId } = req.params;
+
+  try {
+    const { Connection, Client } = await import('@temporalio/client');
+    const connection = await Connection.connect({ address: 'localhost:7233' });
+    const client = new Client({ connection });
+
+    const handle = client.workflow.getHandle(workflowId);
+    const status = await handle.query('getExecutionStatus');
+
+    res.json(status);
+  } catch (err: any) {
+    console.error(`Query error:`, err.message);
+    res.status(404).json({ error: `Workflow not found or completed: ${err.message}` });
+  }
+});
+
+// GET /workflows/search — Search workflows by custom attributes
+app.get('/workflows/search', async (req, res) => {
+  const { userId, subscriptionType, status } = req.query;
+
+  try {
+    const { Connection, Client } = await import('@temporalio/client');
+    const connection = await Connection.connect({ address: 'localhost:7233' });
+    const client = new Client({ connection });
+
+    // Build query from search attributes
+    const conditions: string[] = [];
+    if (userId) conditions.push(`userId = "${userId}"`);
+    if (subscriptionType) conditions.push(`subscriptionType = "${subscriptionType}"`);
+    if (status) conditions.push(`ExecutionStatus = "${status}"`);
+    
+    const query = conditions.length > 0 ? conditions.join(' AND ') : undefined;
+    
+    const workflows: any[] = [];
+    const iter = client.workflow.list({ query });
+    for await (const wf of iter) {
+      workflows.push({
+        workflowId: wf.workflowId,
+        type: wf.type,
+        status: wf.status.name,
+        startTime: wf.startTime,
+        searchAttributes: wf.searchAttributes,
+      });
+      if (workflows.length >= 50) break;
+    }
+
+    res.json({ query: query || '(all)', count: workflows.length, workflows });
+  } catch (err: any) {
+    console.error(`Search error:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = 3000;
 app.listen(PORT, () => {
   console.log(`🚀 API server running on http://localhost:${PORT}`);

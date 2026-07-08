@@ -10,6 +10,7 @@
     "start:scheduler": "ts-node src/scheduler/dispatcher.ts",
     "start:worker:platform": "ts-node src/workers/platform.worker.ts",
     "start:worker:bill": "ts-node src/workers/bill.worker.ts",
+    "start:outbox": "ts-node src/outbox/consumer.ts",
     "test:create": "ts-node src/scripts/create-subscription.ts"
   },
   "dependencies": {

@@ -34,14 +34,14 @@ async function dispatch() {
       const subIds = res.rows.map(r => r.subscription_id);
       const subsResult = subIds.length > 0
         ? await pool.query(
-            `SELECT id, destination_id, amount, max_retries FROM subscriptions WHERE id = ANY($1)`,
+            `SELECT id, user_id, destination_id, amount, max_retries FROM subscriptions WHERE id = ANY($1)`,
             [subIds]
           )
         : { rows: [] };
       const subsMap = new Map(subsResult.rows.map((s: any) => [s.id, s]));
 
       for (const row of res.rows) {
-        const sub = subsMap.get(row.subscription_id) || { destination_id: 'unknown', amount: 0, max_retries: 3 };
+        const sub = subsMap.get(row.subscription_id) || { user_id: 'unknown', destination_id: 'unknown', amount: 0, max_retries: 3 };
         const workflowId = `recurring-${row.subscription_id}-${row.due_at.toISOString().split('T')[0]}`;
 
         try {
@@ -53,6 +53,7 @@ async function dispatch() {
               destinationId: sub.destination_id,
               amount: parseFloat(sub.amount),
               maxRetries: sub.max_retries,
+              userId: sub.user_id,
               metadata: {},
             }],
             taskQueue: 'payments-platform',

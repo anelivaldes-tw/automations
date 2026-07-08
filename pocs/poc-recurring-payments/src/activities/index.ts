@@ -153,3 +153,33 @@ export async function executeCharge(amount: number, destinationId: string): Prom
   console.log(`[executeCharge] Amount: ${amount} → Biller: ${destinationId} → ${success ? 'SUCCESS' : 'FAILED'}`);
   return success ? 'SUCCESS' : 'FAILED';
 }
+
+// ============================================================
+// P2P domain activities (for p2pPaymentWorkflow)
+// In production, these live in ms-p2p-payments (a separate service).
+// ============================================================
+
+export async function validateP2PRecipient(destinationId: string): Promise<boolean> {
+  // In production: call wallet/account service to verify recipient is active
+  console.log(`[validateP2PRecipient] Checking wallet: ${destinationId}`);
+  // Simulate 95% of recipients are valid
+  const valid = Math.random() > 0.05;
+  console.log(`[validateP2PRecipient] ${destinationId} → ${valid ? 'ACTIVE' : 'NOT_FOUND'}`);
+  return valid;
+}
+
+export async function executeP2PTransfer(amount: number, destinationId: string): Promise<string> {
+  // In production: call core banking API for wallet-to-wallet transfer
+  // Can fail due to: insufficient funds, recipient limit exceeded, system error
+  const roll = Math.random();
+  let result: string;
+  if (roll > 0.15) {
+    result = 'SUCCESS';
+  } else if (roll > 0.05) {
+    result = 'INSUFFICIENT_FUNDS';
+  } else {
+    result = 'SYSTEM_ERROR';
+  }
+  console.log(`[executeP2PTransfer] S/${amount} → ${destinationId} → ${result}`);
+  return result === 'SUCCESS' ? 'SUCCESS' : 'FAILED';
+}
