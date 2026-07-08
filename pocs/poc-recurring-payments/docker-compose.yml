@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: poc_recurring
+      POSTGRES_USER: poc
+      POSTGRES_PASSWORD: poc123
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # Temporal server: use CLI instead of Docker
+  # temporal server start-dev --ui-port 8233 --db-filename temporal_poc.db
+  # Server: localhost:7233 | UI: http://localhost:8233
+
+volumes:
+  pgdata:
