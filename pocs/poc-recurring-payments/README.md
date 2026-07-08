@@ -2,6 +2,24 @@
 
 Proof of Concept que valida la arquitectura de pagos recurrentes automatizados usando **Temporal** como orquestador de workflows.
 
+## Tabla de Contenidos
+
+- [Arquitectura General](#arquitectura-general)
+- [Flujo de Ejecución Detallado](#flujo-de-ejecución-detallado)
+- [Patrones Arquitectónicos Validados](#patrones-arquitectónicos-validados)
+- [Prerequisitos](#prerequisitos)
+- [Quick Start](#quick-start)
+- [API — Endpoints y Curls](#api--endpoints-y-curls)
+- [Verificar que Funciona](#verificar-que-funciona)
+- [Estructura del Proyecto](#estructura-del-proyecto)
+- [Modelo de Datos](#modelo-de-datos)
+- [Configuración](#configuración)
+- [Notas de Producción vs PoC](#notas-de-producción-vs-poc)
+- [Signals, Queries y Search Attributes](#signals-queries-y-search-attributes)
+- [Outbox Consumer](#outbox-consumer)
+- [Comunicación entre Servicios](#comunicación-entre-servicios)
+- [Decisiones Arquitectónicas Abiertas](#decisiones-arquitectónicas-abiertas)
+
 ---
 
 ## Arquitectura General
