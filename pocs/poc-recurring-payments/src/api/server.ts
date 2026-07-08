@@ -1,0 +1,255 @@
+import express from 'express';
+import { Connection, Client } from '@temporalio/client';
+import { pool } from '../db/pool';
+
+const app = express();
+app.use(express.json());
+
+// Shared Temporal client (lazy-initialized)
+let temporalClient: Client | null = null;
+async function getTemporalClient(): Promise<Client> {
+  if (!temporalClient) {
+    const connection = await Connection.connect({ address: 'localhost:7233' });
+    temporalClient = new Client({ connection });
+  }
+  return temporalClient;
+}
+
+// POST /subscriptions — Create a recurring payment subscription
+app.post('/subscriptions', async (req, res) => {
+  const { userId, subscriptionType, destinationId, amount, frequency } = req.body;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Insert subscription
+    const subResult = await client.query(
+      `INSERT INTO subscriptions (user_id, subscription_type, destination_id, amount, frequency, next_execution_at)
+       VALUES ($1, $2, $3, $4, $5, now() + INTERVAL '10 seconds')
+       RETURNING id, next_execution_at`,
+      [userId || 'user-001', subscriptionType || 'BILL', destinationId || 'biller-001', amount || 50.00, frequency || 'DAILY']
+    );
+
+    const sub = subResult.rows[0];
+
+    // Enqueue first execution
+    await client.query(
+      `INSERT INTO payment_execution_queue (subscription_id, subscription_type, due_at)
+       VALUES ($1, $2, $3)`,
+      [sub.id, subscriptionType || 'BILL', sub.next_execution_at]
+    );
+
+    // Write reminder to outbox
+    await client.query(
+      `INSERT INTO notification_outbox (subscription_id, event_type, delivery_class, payload, idempotency_key, scheduled_for)
+       VALUES ($1, 'REMINDER', 'DELAYED', $2, $3, $4)`,
+      [
+        sub.id,
+        JSON.stringify({ message: 'Your automatic payment will execute soon' }),
+        `${sub.id}-reminder-first`,
+        sub.next_execution_at,
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    console.log(`✅ Subscription created: ${sub.id} (type: ${subscriptionType || 'BILL'})`);
+    res.json({ id: sub.id, nextExecution: sub.next_execution_at });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    console.error('Error creating subscription:', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// PATCH /subscriptions/:id/cancel — Cancel a subscription (also cancels running workflow)
+app.patch('/subscriptions/:id/cancel', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    // Update DB status
+    await pool.query(
+      `UPDATE subscriptions SET status = 'INACTIVE', updated_at = now() WHERE id = $1`,
+      [id]
+    );
+
+    // Cancel any running workflow for this subscription via Temporal
+    const client = await getTemporalClient();
+
+    // Find and cancel active workflows for this subscription
+    const today = new Date().toISOString().split('T')[0];
+    const workflowId = `recurring-${id}-${today}`;
+    try {
+      const handle = client.workflow.getHandle(workflowId);
+      await handle.cancel();
+      console.log(`🚫 Cancelled workflow: ${workflowId}`);
+    } catch (err: any) {
+      // Workflow may not exist or already completed — that's fine
+      console.log(`ℹ️ No active workflow to cancel: ${workflowId}`);
+    }
+
+    res.json({ id, status: 'INACTIVE', message: 'Subscription cancelled' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /subscriptions — List all
+app.get('/subscriptions', async (_req, res) => {
+  const result = await pool.query('SELECT * FROM subscriptions ORDER BY created_at DESC');
+  res.json(result.rows);
+});
+
+// GET /outbox — See notification events
+app.get('/outbox', async (_req, res) => {
+  const result = await pool.query('SELECT * FROM notification_outbox ORDER BY created_at DESC');
+  res.json(result.rows);
+});
+
+// GET /queue — See execution queue
+app.get('/queue', async (_req, res) => {
+  const result = await pool.query('SELECT * FROM payment_execution_queue ORDER BY created_at DESC');
+  res.json(result.rows);
+});
+
+// --- Internal endpoints (called by child workflows in other services) ---
+
+// POST /internal/attempt-failed — Child workflow notifies a failed attempt
+app.post('/internal/attempt-failed', async (req, res) => {
+  const { subscriptionId, attempt, maxAttempts, nextRetryIn } = req.body;
+  const idempotencyKey = `${subscriptionId}-attempt-${attempt}-failed`;
+
+  try {
+    await pool.query(
+      `INSERT INTO notification_outbox (subscription_id, event_type, delivery_class, payload, idempotency_key)
+       VALUES ($1, 'ATTEMPT_FAILED', 'IMMEDIATE', $2, $3)
+       ON CONFLICT (idempotency_key) DO NOTHING`,
+      [
+        subscriptionId,
+        JSON.stringify({
+          message: `Tu pago falló (intento ${attempt}/${maxAttempts}). Reintentaremos en ${nextRetryIn}.`,
+          attempt,
+          maxAttempts,
+          nextRetryIn,
+        }),
+        idempotencyKey,
+      ]
+    );
+    console.log(`[internal/attempt-failed] ${subscriptionId} → attempt ${attempt} → outbox written ✅`);
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error('[internal/attempt-failed] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Signal & Query endpoints (interact with running workflows) ---
+
+// POST /workflows/:workflowId/signal/updateAmount — Send signal to change amount mid-flight
+app.post('/workflows/:workflowId/signal/updateAmount', async (req, res) => {
+  const { workflowId } = req.params;
+  const { amount } = req.body;
+
+  try {
+    const client = await getTemporalClient();
+
+    const handle = client.workflow.getHandle(workflowId);
+    await handle.signal('updateAmount', amount);
+
+    console.log(`📡 Signal sent: ${workflowId} → updateAmount(${amount})`);
+    res.json({ ok: true, message: `Amount updated to ${amount} for workflow ${workflowId}` });
+  } catch (err: any) {
+    console.error(`Signal error:`, err.message);
+    res.status(404).json({ error: `Workflow not found or completed: ${err.message}` });
+  }
+});
+
+// GET /workflows/:workflowId/query/progress — Query child workflow progress
+app.get('/workflows/:workflowId/query/progress', async (req, res) => {
+  const { workflowId } = req.params;
+
+  try {
+    const client = await getTemporalClient();
+
+    const handle = client.workflow.getHandle(workflowId);
+    const progress = await handle.query('getProgress');
+
+    res.json(progress);
+  } catch (err: any) {
+    console.error(`Query error:`, err.message);
+    res.status(404).json({ error: `Workflow not found or completed: ${err.message}` });
+  }
+});
+
+// GET /workflows/:workflowId/query/status — Query parent workflow execution status
+app.get('/workflows/:workflowId/query/status', async (req, res) => {
+  const { workflowId } = req.params;
+
+  try {
+    const client = await getTemporalClient();
+
+    const handle = client.workflow.getHandle(workflowId);
+    const status = await handle.query('getExecutionStatus');
+
+    res.json(status);
+  } catch (err: any) {
+    console.error(`Query error:`, err.message);
+    res.status(404).json({ error: `Workflow not found or completed: ${err.message}` });
+  }
+});
+
+// GET /workflows/search — Search workflows by custom attributes
+app.get('/workflows/search', async (req, res) => {
+  const { userId, subscriptionType, status } = req.query;
+
+  try {
+    const client = await getTemporalClient();
+
+    // Build query from search attributes
+    const conditions: string[] = [];
+    if (userId) conditions.push(`userId = "${userId}"`);
+    if (subscriptionType) conditions.push(`subscriptionType = "${subscriptionType}"`);
+    if (status) conditions.push(`ExecutionStatus = "${status}"`);
+    
+    const query = conditions.length > 0 ? conditions.join(' AND ') : undefined;
+    
+    const workflows: any[] = [];
+    const iter = client.workflow.list({ query });
+    for await (const wf of iter) {
+      workflows.push({
+        workflowId: wf.workflowId,
+        type: wf.type,
+        status: wf.status?.name || String(wf.status),
+        startTime: wf.startTime,
+        searchAttributes: wf.searchAttributes,
+      });
+      if (workflows.length >= 50) break;
+    }
+
+    res.json({ query: query || '(all)', count: workflows.length, workflows });
+  } catch (err: any) {
+    console.error(`Search error:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Prevent unhandled rejections from crashing the process
+process.on('unhandledRejection', (err: any) => {
+  console.error('⚠️ Unhandled rejection:', err?.message || err);
+});
+
+const PORT = 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 API server running on http://localhost:${PORT}`);
+  console.log(`   POST /subscriptions  — create a subscription`);
+  console.log(`   GET  /subscriptions  — list all`);
+  console.log(`   GET  /queue          — see execution queue`);
+  console.log(`   GET  /outbox         — see notifications`);
+  console.log(`   POST /workflows/:id/signal/updateAmount`);
+  console.log(`   GET  /workflows/:id/query/progress`);
+  console.log(`   GET  /workflows/:id/query/status`);
+  console.log(`   GET  /workflows/search?userId=X&subscriptionType=Y`);
+});

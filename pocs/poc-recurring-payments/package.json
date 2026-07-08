@@ -1,0 +1,34 @@
+{
+  "name": "poc-recurring-payments",
+  "version": "1.0.0",
+  "description": "PoC - PAD 213: Generalized Recurring Payments with Temporal",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "db:setup": "ts-node src/db/setup.ts",
+    "start:api": "ts-node src/api/server.ts",
+    "start:scheduler": "ts-node src/scheduler/dispatcher.ts",
+    "start:worker:platform": "ts-node src/workers/platform.worker.ts",
+    "start:worker:bill": "ts-node src/workers/bill.worker.ts",
+    "start:worker:p2p": "ts-node src/workers/p2p.worker.ts",
+    "start:outbox": "ts-node src/outbox/consumer.ts",
+    "test:create": "ts-node src/scripts/create-subscription.ts"
+  },
+  "dependencies": {
+    "@temporalio/activity": "^1.11.0",
+    "@temporalio/client": "^1.11.0",
+    "@temporalio/worker": "^1.11.0",
+    "@temporalio/workflow": "^1.11.0",
+    "express": "^4.18.0",
+    "pg": "^8.12.0",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.0.0",
+    "@types/pg": "^8.11.0",
+    "@types/uuid": "^9.0.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.4.0"
+  }
+}
