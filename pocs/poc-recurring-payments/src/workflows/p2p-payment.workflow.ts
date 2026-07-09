@@ -1,13 +1,26 @@
 import { proxyActivities, sleep, isCancellation } from '@temporalio/workflow';
 import type { PaymentExecutionInput } from './recurring-payment.workflow';
 
+// Domain activities (wallet/transfer interaction)
 const activities = proxyActivities<{
   validateP2PRecipient: (destinationId: string) => Promise<boolean>;
   executeP2PTransfer: (amount: number, destinationId: string) => Promise<string>;
-  publishP2PEvent: (input: { subscriptionId: string; eventType: string; payload: Record<string, unknown> }) => Promise<void>;
 }>({
   startToCloseTimeout: '10s',
   retry: { maximumAttempts: 1 },
+});
+
+// Kafka publish activity — separate retry policy (more tolerant to transient failures)
+const { publishP2PEvent } = proxyActivities<{
+  publishP2PEvent: (input: { subscriptionId: string; eventType: string; payload: Record<string, unknown>; idempotencyKey?: string }) => Promise<void>;
+}>({
+  startToCloseTimeout: '10s',
+  retry: {
+    maximumAttempts: 5,
+    initialInterval: '1s',
+    backoffCoefficient: 2,
+    maximumInterval: '30s',
+  },
 });
 
 const RETRY_DELAY = '1 minute'; // En producción: '1 day'
@@ -30,9 +43,10 @@ export async function p2pPaymentWorkflow(input: PaymentExecutionInput): Promise<
   const valid = await activities.validateP2PRecipient(input.destinationId);
   if (!valid) {
     console.log(`[P2P] ❌ Recipient ${input.destinationId} not found or inactive`);
-    await activities.publishP2PEvent({
+    await publishP2PEvent({
       subscriptionId: input.subscriptionId,
       eventType: 'PAYMENT_FAILED',
+      idempotencyKey: `${input.subscriptionId}-${input.executionDate}-INVALID_RECIPIENT`,
       payload: { reason: 'INVALID_RECIPIENT', destinationId: input.destinationId },
     });
     return { status: 'FAILED', attemptCount: 0 };
@@ -47,9 +61,10 @@ export async function p2pPaymentWorkflow(input: PaymentExecutionInput): Promise<
 
       if (result === 'SUCCESS') {
         console.log(`[P2P] ✅ Transfer successful on attempt ${attempt}`);
-        await activities.publishP2PEvent({
+        await publishP2PEvent({
           subscriptionId: input.subscriptionId,
           eventType: 'PAYMENT_SUCCEEDED',
+          idempotencyKey: `${input.subscriptionId}-${input.executionDate}-SUCCESS-attempt${attempt}`,
           payload: { amount: input.amount, attempt, destinationId: input.destinationId },
         });
         return { status: 'SUCCESS', attemptCount: attempt };
@@ -57,9 +72,10 @@ export async function p2pPaymentWorkflow(input: PaymentExecutionInput): Promise<
 
       // Failed — notify and retry
       if (attempt < maxAttempts) {
-        await activities.publishP2PEvent({
+        await publishP2PEvent({
           subscriptionId: input.subscriptionId,
           eventType: 'ATTEMPT_FAILED',
+          idempotencyKey: `${input.subscriptionId}-${input.executionDate}-ATTEMPT_FAILED-${attempt}`,
           payload: {
             attempt,
             maxAttempts,
@@ -81,9 +97,10 @@ export async function p2pPaymentWorkflow(input: PaymentExecutionInput): Promise<
 
   console.log(`[P2P] ❌ All ${maxAttempts} attempts exhausted`);
   // Notify final failure
-  await activities.publishP2PEvent({
+  await publishP2PEvent({
     subscriptionId: input.subscriptionId,
     eventType: 'PAYMENT_FAILED',
+    idempotencyKey: `${input.subscriptionId}-${input.executionDate}-PAYMENT_FAILED`,
     payload: { amount: input.amount, attempts: maxAttempts, destinationId: input.destinationId },
   });
   return { status: 'FAILED', attemptCount: maxAttempts };

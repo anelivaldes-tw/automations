@@ -3,6 +3,9 @@ import * as p2pActivities from '../activities/p2p.activities';
 import * as path from 'path';
 
 async function run() {
+  // Connect Kafka producer before starting the worker
+  await p2pActivities.initP2PKafka();
+
   const worker = await Worker.create({
     workflowsPath: path.resolve(__dirname, '../workflows'),
     activities: p2pActivities,

@@ -1,13 +1,11 @@
-import { connectProducer, publishEvent, disconnectProducer } from '../kafka/producer';
+import { connectProducer, publishEvent } from '../kafka/producer';
 
-// Initialize Kafka connection for this domain
-let kafkaReady = false;
-
-async function ensureKafka() {
-  if (!kafkaReady) {
-    await connectProducer();
-    kafkaReady = true;
-  }
+/**
+ * Initialize Kafka producer at worker startup.
+ * Call this once from the worker before starting.
+ */
+export async function initBillKafka(): Promise<void> {
+  await connectProducer();
 }
 
 /**
@@ -37,17 +35,19 @@ export async function publishBillEvent(input: {
   subscriptionId: string;
   eventType: 'ATTEMPT_FAILED' | 'PAYMENT_SUCCEEDED' | 'PAYMENT_FAILED';
   payload: Record<string, unknown>;
+  idempotencyKey?: string;
 }): Promise<void> {
-  await ensureKafka();
+  const idempotencyKey = input.idempotencyKey || `${input.subscriptionId}-${input.eventType}-${Date.now()}`;
 
   const message = {
     domain: 'bill',
     subscriptionId: input.subscriptionId,
     eventType: input.eventType,
+    idempotencyKey,
     payload: input.payload,
     publishedAt: new Date().toISOString(),
   };
 
   await publishEvent(input.subscriptionId, message);
-  console.log(`[Bill→Kafka] 📤 ${input.eventType} | sub: ${input.subscriptionId}`);
+  console.log(`[Bill→Kafka] 📤 ${input.eventType} | sub: ${input.subscriptionId} | key: ${idempotencyKey}`);
 }

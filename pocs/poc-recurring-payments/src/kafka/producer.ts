@@ -9,14 +9,22 @@ const kafka = new Kafka({
 });
 
 let producer: Producer;
+let connected = false;
 
 export async function connectProducer(): Promise<void> {
-  producer = kafka.producer();
+  if (connected) return;
+  producer = kafka.producer({
+    idempotent: true, // Enable Kafka-level idempotence (exactly-once per partition)
+  });
   await producer.connect();
-  console.log(`🔌 Kafka producer connected → broker: ${BROKER}, topic: ${TOPIC}`);
+  connected = true;
+  console.log(`🔌 Kafka producer connected → broker: ${BROKER}, topic: ${TOPIC} (idempotent: true)`);
 }
 
 export async function publishEvent(key: string, value: object): Promise<void> {
+  if (!connected) {
+    throw new Error('Kafka producer not connected. Call connectProducer() at worker startup.');
+  }
   await producer.send({
     topic: TOPIC,
     messages: [
@@ -29,7 +37,8 @@ export async function publishEvent(key: string, value: object): Promise<void> {
 }
 
 export async function disconnectProducer(): Promise<void> {
-  if (producer) {
+  if (producer && connected) {
     await producer.disconnect();
+    connected = false;
   }
 }
