@@ -8,7 +8,7 @@ En Yape tenemos múltiples tipos de pagos recurrentes (servicios, P2P, top-ups) 
 
 - Orquesta pagos con reintentos durables (sobreviven crashes)
 - Escala cada tipo de pago de forma independiente
-- Notifica al usuario en cada fallo intermedio
+- Cada dominio notifica al usuario directamente (via Kafka)
 - Permite cancelar un cobro en curso inmediatamente
 - Re-encola la siguiente ejecución de forma atómica
 
@@ -17,6 +17,7 @@ En Yape tenemos múltiples tipos de pagos recurrentes (servicios, P2P, top-ups) 
 ## Tabla de Contenidos
 
 - [Arquitectura General](#arquitectura-general)
+- [Principio Arquitectónico Clave](#principio-arquitectónico-clave)
 - [Flujo de Ejecución Detallado](#flujo-de-ejecución-detallado)
 - [Patrones Arquitectónicos Validados](#patrones-arquitectónicos-validados)
 - [Quick Start](#quick-start)
@@ -26,7 +27,7 @@ En Yape tenemos múltiples tipos de pagos recurrentes (servicios, P2P, top-ups) 
 - [Modelo de Datos](#modelo-de-datos)
 - [Configuración](#configuración)
 - [Signals y Queries](#signals-y-queries)
-- [Outbox Consumer](#outbox-consumer)
+- [Kafka — Eventos de Notificación](#kafka--eventos-de-notificación)
 - [Comunicación entre Servicios](#comunicación-entre-servicios)
 - [Notas de Producción vs PoC](#notas-de-producción-vs-poc)
 - [Decisiones Arquitectónicas Abiertas](#decisiones-arquitectónicas-abiertas)
@@ -49,7 +50,6 @@ flowchart TD
     subgraph DB["PostgreSQL (:5433)"]
         SUBS[subscriptions]
         QUEUE[payment_execution_queue]
-        OUTBOX[notification_outbox]
     end
 
     subgraph TEMPORAL["Temporal Server (:7233)"]
@@ -68,13 +68,8 @@ flowchart TD
         TOPIC[topic: notifications]
     end
 
-    subgraph OUTBOX_CONSUMER["Outbox Consumer"]
-        OC[Polling consumer<br/>→ Kafka producer]
-    end
-
     POST -->|"TX atómica"| SUBS
     POST -->|"TX atómica"| QUEUE
-    POST -->|"TX atómica"| OUTBOX
 
     CANCEL -->|"status=INACTIVE"| SUBS
     CANCEL -->|"workflow.cancel()"| TEMPORAL
@@ -93,10 +88,63 @@ flowchart TD
     W_P2P -.->|"ejecuta"| WF_P2P
 
     WF_P -->|"recordPaymentResult<br/>(TX atómica + re-enqueue)"| DB
-    WF_BILL -->|"notifyAttemptFailed<br/>(HTTP → platform API)"| OUTBOX
-    OC -->|"poll PENDING → mark PUBLISHED"| OUTBOX
-    OC -->|"publish events"| TOPIC
+    WF_BILL -->|"publishBillEvent<br/>(activity)"| TOPIC
+    WF_P2P -->|"publishP2PEvent<br/>(activity)"| TOPIC
 ```
+
+---
+
+## Principio Arquitectónico Clave
+
+> **Platform = Scheduling Engine. Domains = Ejecución + Notificaciones.**
+
+```mermaid
+flowchart LR
+    subgraph PLATFORM["Platform (ms-payment-subscriptions)"]
+        direction TB
+        P1[Subscription Lifecycle]
+        P2[Execution Queue]
+        P3[Scheduler / Dispatcher]
+        P4[RecurringPaymentWorkflow]
+        P5[Strategy Resolver]
+    end
+
+    subgraph BILL_DOMAIN["Bill Domain (autónomo)"]
+        direction TB
+        B1[billPaymentWorkflow]
+        B2[validateBiller]
+        B3[executeCharge]
+        B4[publishBillEvent → Kafka]
+    end
+
+    subgraph P2P_DOMAIN["P2P Domain (autónomo)"]
+        direction TB
+        D1[p2pPaymentWorkflow]
+        D2[validateP2PRecipient]
+        D3[executeP2PTransfer]
+        D4[publishP2PEvent → Kafka]
+    end
+
+    PLATFORM -->|"executeChild"| BILL_DOMAIN
+    PLATFORM -->|"executeChild"| P2P_DOMAIN
+    BILL_DOMAIN -->|"result"| PLATFORM
+    P2P_DOMAIN -->|"result"| PLATFORM
+```
+
+**¿Por qué este diseño?**
+
+| Responsabilidad | Dueño | Razón |
+|---|---|---|
+| Cuándo cobrar (scheduling) | Platform | Es lógica transversal a todos los tipos |
+| Cómo cobrar (ejecución) | Cada dominio | Cada biller/wallet tiene su lógica |
+| Qué notificar al usuario | Cada dominio | Cada dominio conoce mejor su UX de notificación |
+| Estado de la suscripción | Platform | Es lifecycle management centralizado |
+
+**Beneficios:**
+- Los child workflows son **100% autónomos** — no dependen de la API de platform
+- Cada equipo controla su flujo de notificaciones (mensaje, timing, canal)
+- Platform no tiene outbox ni publisher — es puramente orquestación
+- Agregar un nuevo tipo de pago = nuevo child workflow + nueva entry en Strategy Resolver
 
 ---
 
@@ -114,7 +162,6 @@ sequenceDiagram
     API->>DB: BEGIN TX
     API->>DB: INSERT subscriptions (status=ACTIVE)
     API->>DB: INSERT payment_execution_queue (status=READY, due_at=+10s)
-    API->>DB: INSERT notification_outbox (REMINDER, DELAYED)
     API->>DB: COMMIT
     API-->>U: { id, nextExecution }
 ```
@@ -144,14 +191,14 @@ Por cada row, inicia un `recurringPaymentWorkflow` en Temporal con:
 
 El scheduler también ejecuta **recovery automático**: si hay rows en PROCESSING por más de 5 minutos (scheduler crash), las libera a READY.
 
-### 3. Parent Workflow → Child Workflow (con reintentos y cancelación)
+### 3. Parent Workflow → Child Workflow (con notificaciones directas a Kafka)
 
 ```mermaid
 sequenceDiagram
     participant P as recurringPaymentWorkflow<br/>(Platform Worker)
     participant C as billPaymentWorkflow<br/>(Bill Worker)
+    participant K as Kafka (notifications)
     participant DB as PostgreSQL
-    participant OB as notification_outbox
 
     P->>P: validateSubscription → ¿ACTIVE?
     alt Inactiva
@@ -164,23 +211,20 @@ sequenceDiagram
 
     C->>C: validateBiller ✅
     C->>C: Attempt 1: executeCharge → ❌ FAILED
-    C->>OB: ATTEMPT_FAILED "Tu pago falló, reintentaremos mañana"
-    C->>C: sleep('1 day') ⏳ [durable timer]
+    C->>K: publishBillEvent(ATTEMPT_FAILED)
+    C->>C: sleep('1 minute') ⏳ [durable timer]
 
     alt Usuario cancela durante sleep
         C->>C: isCancellation() → true
         C-->>P: { status: 'CANCELLED', attemptCount: 1 }
     end
 
-    C->>C: Attempt 2: executeCharge → ❌ FAILED
-    C->>OB: ATTEMPT_FAILED "Tu pago falló (2/3), reintentaremos mañana"
-    C->>C: sleep('1 day') ⏳
-
-    C->>C: Attempt 3: executeCharge → ✅ SUCCESS
-    C-->>P: { status: 'SUCCESS', attemptCount: 3 }
+    C->>C: Attempt 2: executeCharge → ✅ SUCCESS
+    C->>K: publishBillEvent(PAYMENT_SUCCEEDED)
+    C-->>P: { status: 'SUCCESS', attemptCount: 2 }
 
     P->>DB: recordPaymentResult (TX atómica)
-    Note over P,DB: UPDATE subscription + UPDATE queue(DONE) + INSERT outbox + RE-ENQUEUE next execution
+    Note over P,DB: UPDATE subscription + UPDATE queue(DONE) + RE-ENQUEUE next execution
 ```
 
 ### 4. Re-encolamiento (Truly Recurring)
@@ -190,7 +234,6 @@ Cuando un pago es exitoso, `recordPaymentResult` ejecuta en una **TX atómica**:
 2. Reset `retry_count = 0`
 3. Marca queue actual como DONE
 4. **Inserta nuevo row en queue** (READY, due_at = next_execution_at)
-5. Escribe PAYMENT_SUCCEEDED en outbox
 
 Esto garantiza que la subscription se ejecute indefinidamente hasta que sea cancelada.
 
@@ -198,8 +241,8 @@ Esto garantiza que la subscription se ejecute indefinidamente hasta que sea canc
 
 | Resultado | Descripción | Efecto en BD |
 |-----------|-------------|--------------|
-| `SUCCESS` | Cobro exitoso (en cualquier intento) | queue→DONE, outbox→PAYMENT_SUCCEEDED, **re-enqueue next day** |
-| `FAILED` | Agotó todos los reintentos (max_retries) | queue→FAILED, outbox→PAYMENT_FAILED, **scheduleRetry** |
+| `SUCCESS` | Cobro exitoso (en cualquier intento) | queue→DONE, **re-enqueue next day** |
+| `FAILED` | Agotó todos los reintentos (max_retries) | queue→FAILED, **scheduleRetry** |
 | `CANCELLED` | Usuario canceló durante un retry sleep | queue→FAILED (vía parent), status→INACTIVE |
 | `SKIPPED_INACTIVE` | Subscription ya estaba inactiva | Sin cambios en BD |
 
@@ -235,18 +278,17 @@ El `sleep()` de Temporal es **cancellation-aware**: cuando se cancela el workflo
 | Patrón | Implementación |
 |--------|---------------|
 | **Strategy Pattern** | El parent workflow resuelve `subscription_type` → child workflow + task queue |
-| **Transactional Outbox** | Notificaciones se escriben en la misma TX que el resultado del pago |
+| **Domain-owned notifications** | Cada child publica sus eventos directamente a Kafka (sin outbox centralizado) |
 | **Idempotency** | Workflow IDs determinísticos (`{sub_id}-{date}-{type}`) evitan duplicados |
 | **Durable Timers** | `sleep('1 day')` en Temporal sobrevive crashes y reinicios |
-| **Separation of Concerns** | Task queues separadas por dominio (platform / bill / p2p) |
-| **Retry con notificación** | Cada fallo intermedio notifica al usuario vía outbox antes del retry |
+| **Separation of Concerns** | Platform = scheduling. Domains = ejecución + notificaciones |
+| **Task Queue isolation** | Cada dominio escala independientemente (payments-bill, payments-p2p) |
 | **Re-encolamiento atómico** | Próxima ejecución se inserta en la misma TX que el resultado |
 | **Cancellation-aware** | Child workflow detecta cancelación con `isCancellation()` y termina limpiamente |
 | **Configurable retries** | `max_retries` se lee de BD, no hardcodeado en el workflow |
 | **Signals** | `updateAmount` permite cambiar el monto de cobro mientras el workflow está en retry-sleep |
 | **Queries** | `getProgress` inspecciona el estado del child sin bloquearlo (attempt, amount, status) |
 | **Workflow search** | Buscar workflows por tipo y estado via API y Temporal CLI |
-| **Outbox Consumer** | Polling → publicación real a Kafka (tópico: `notifications`) |
 | **Multi-strategy children** | BILL (cobro a biller) y P2P (transferencia wallet-to-wallet) como workflows separados |
 | **Scheduler recovery** | Rows stuck en PROCESSING >5 min se liberan automáticamente |
 | **Workflow timeout** | `workflowExecutionTimeout: '4 days'` previene workflows zombie |
@@ -259,6 +301,7 @@ El `sleep()` de Temporal es **cancellation-aware**: cuando se cancela el workflo
 - **Docker** (para PostgreSQL)
 - **Node.js 18+**
 - **Temporal CLI** (`brew install temporal`)
+- **Kafka** corriendo en `localhost:9092` con tópico `notifications`
 
 ---
 
@@ -274,16 +317,17 @@ docker-compose up -d
 # 3. Levantar Temporal (en una terminal separada)
 temporal server start-dev --ui-port 8233 --db-filename temporal_poc.db
 
-# 4. Crear schema de BD
+# 4. Asegurarse que Kafka esté corriendo (localhost:9092, topic: notifications)
+
+# 5. Crear schema de BD
 npm run db:setup
 
-# 5. Levantar workers y servicios (cada uno en una terminal)
+# 6. Levantar workers y servicios (cada uno en una terminal)
 npm run start:worker:platform   # Terminal 1 — Platform Worker (task queue: payments-platform)
-npm run start:worker:bill       # Terminal 2 — Bill Worker (task queue: payments-bill)
-npm run start:worker:p2p        # Terminal 3 — P2P Worker (task queue: payments-p2p)
+npm run start:worker:bill       # Terminal 2 — Bill Worker (task queue: payments-bill) + Kafka
+npm run start:worker:p2p        # Terminal 3 — P2P Worker (task queue: payments-p2p) + Kafka
 npm run start:scheduler         # Terminal 4 — Scheduler (polling)
 npm run start:api               # Terminal 5 — API REST
-npm run start:outbox            # Terminal 6 — Outbox Consumer
 
 # 7. Crear subscripciones de prueba
 npm run test:create
@@ -304,17 +348,20 @@ curl -s -X POST http://localhost:3000/subscriptions \
 # Esperar 15 segundos y verificar resultado
 sleep 15
 
-# ¿Se cobró? Debe mostrar PAYMENT_SUCCEEDED
-curl -s http://localhost:3000/outbox | jq '.[] | select(.event_type | contains("PAYMENT")) | {event_type, subscription_id}'
-
 # ¿Se re-encoló para mañana? Debe mostrar un row READY con due_at de mañana
 curl -s http://localhost:3000/queue | jq '.[] | {status, due_at}' | head -10
 ```
 
 **Qué esperar:**
 - En la terminal del Bill Worker: `[BillPayment] Attempt 1/3 → SUCCESS ✅`
-- En la terminal del Outbox Consumer: `📤 [PAYMENT_SUCCEEDED] → kafka://payments.events`
-- Si falló el primer intento (20% probabilidad): verás `ATTEMPT_FAILED` + sleep 1 min + reintento
+- En la terminal del Bill Worker: `[Bill→Kafka] 📤 PAYMENT_SUCCEEDED | sub: ...`
+- Si falló el primer intento (20% probabilidad): verás `ATTEMPT_FAILED` → Kafka + sleep 1 min + reintento
+- En Kafka (topic notifications): mensaje con el evento
+
+**Verificar en Kafka:**
+```bash
+kafka-console-consumer --bootstrap-server localhost:9092 --topic notifications --from-beginning
+```
 
 ---
 
@@ -327,13 +374,11 @@ curl -s -X POST http://localhost:3000/subscriptions \
   -d '{"userId":"user-002","subscriptionType":"P2P","destinationId":"wallet-mama","amount":200.00}' | jq .
 
 sleep 15
-
-# Verificar — debe aparecer en el P2P Worker (no en el Bill Worker)
-curl -s http://localhost:3000/outbox | jq '.[-1] | {event_type, subscription_id}'
 ```
 
 **Qué esperar:**
 - Terminal P2P Worker: `[P2P] validateP2PRecipient → ACTIVE` + `executeP2PTransfer → SUCCESS`
+- Terminal P2P Worker: `[P2P→Kafka] 📤 PAYMENT_SUCCEEDED | sub: ...`
 - Terminal Bill Worker: **nada** (confirma que task queues están aisladas)
 
 ---
@@ -422,8 +467,6 @@ Abre http://localhost:8233 para ver:
 
 ---
 
----
-
 ## API — Endpoints y Curls
 
 ### Crear una subscription
@@ -475,12 +518,6 @@ curl http://localhost:3000/subscriptions | jq
 
 ```bash
 curl http://localhost:3000/queue | jq
-```
-
-### Ver outbox de notificaciones
-
-```bash
-curl http://localhost:3000/outbox | jq
 ```
 
 ### Crear subscription P2P (transferencia entre wallets)
@@ -545,7 +582,7 @@ curl "http://localhost:3000/workflows/search?status=Running" | jq
 temporal workflow list -q 'WorkflowType="recurringPaymentWorkflow" AND ExecutionStatus="Running"'
 ```
 
-
+---
 
 ## Estructura del Proyecto
 
@@ -554,15 +591,13 @@ src/
 ├── api/
 │   └── server.ts              # Express API — CRUD + cancel + signals + queries + search
 ├── activities/
-│   └── index.ts               # Activities: validateSubscription, recordPaymentResult,
-│                              #   scheduleRetry, notifyAttemptFailed, validateBiller,
-│                              #   executeCharge, validateP2PRecipient, executeP2PTransfer
+│   ├── index.ts               # Platform activities: validateSubscription, recordPaymentResult, scheduleRetry
+│   ├── bill.activities.ts     # Bill domain: validateBiller, executeCharge, publishBillEvent (→ Kafka)
+│   └── p2p.activities.ts      # P2P domain: validateP2PRecipient, executeP2PTransfer, publishP2PEvent (→ Kafka)
 ├── db/
 │   ├── pool.ts                # Conexión a PostgreSQL
-│   ├── schema.sql             # DDL: subscriptions, payment_execution_queue, notification_outbox
+│   ├── schema.sql             # DDL: subscriptions, payment_execution_queue
 │   └── setup.ts               # Script para crear el schema
-├── outbox/
-│   └── consumer.ts            # Outbox consumer — polling + Kafka publish (topic: notifications)
 ├── kafka/
 │   └── producer.ts            # Kafka producer (kafkajs) — conexión y publish helper
 ├── scheduler/
@@ -570,15 +605,15 @@ src/
 ├── scripts/
 │   └── create-subscription.ts # Script para crear subscripciones de prueba
 ├── workers/
-│   ├── platform.worker.ts     # Worker: task queue 'payments-platform'
-│   ├── bill.worker.ts         # Worker: task queue 'payments-bill'
-│   └── p2p.worker.ts          # Worker: task queue 'payments-p2p'
+│   ├── platform.worker.ts     # Worker: task queue 'payments-platform' (platform activities)
+│   ├── bill.worker.ts         # Worker: task queue 'payments-bill' (bill activities + Kafka)
+│   └── p2p.worker.ts          # Worker: task queue 'payments-p2p' (p2p activities + Kafka)
 └── workflows/
     ├── index.ts               # Exports de workflows
     ├── recurring-payment.workflow.ts  # Parent: validate → strategy → child → record
     │                                  #   + Query: getExecutionStatus
-    ├── bill-payment.workflow.ts       # Child BILL: charge con retries + Signal + Query
-    └── p2p-payment.workflow.ts        # Child P2P: wallet transfer con retries + cancellation
+    ├── bill-payment.workflow.ts       # Child BILL: charge con retries + Signal + Query + Kafka
+    └── p2p-payment.workflow.ts        # Child P2P: wallet transfer con retries + Kafka
 ```
 
 ---
@@ -594,7 +629,7 @@ Estado de la suscripción recurrente del usuario.
 | user_id | TEXT | Usuario dueño |
 | subscription_type | TEXT | BILL, P2P, etc. (determina el child workflow) |
 | status | TEXT | ACTIVE / INACTIVE / SUSPENDED |
-| destination_id | TEXT | Identificador del biller |
+| destination_id | TEXT | Identificador del biller o wallet destino |
 | amount | NUMERIC | Monto a cobrar |
 | next_execution_at | TIMESTAMPTZ | Próxima ejecución programada |
 | retry_count | INT | Reintentos acumulados (se resetea en SUCCESS) |
@@ -607,24 +642,14 @@ Cola de ejecuciones pendientes. El scheduler consume de aquí.
 |-------|------|-------------|
 | id | UUID | PK |
 | subscription_id | UUID | FK → subscriptions |
+| subscription_type | TEXT | Tipo para routing |
 | status | TEXT | READY → PROCESSING → DONE/FAILED |
 | due_at | TIMESTAMPTZ | Cuándo debe ejecutarse |
 | workflow_id | TEXT | ID del workflow en Temporal |
 | locked_at | TIMESTAMPTZ | Timestamp del lock (para recovery >5min) |
 | locked_by | TEXT | Scheduler que lo reclamó |
 
-### `notification_outbox`
-Transactional outbox para notificaciones al usuario.
-
-| Campo | Tipo | Descripción |
-|-------|------|-------------|
-| id | UUID | PK |
-| subscription_id | UUID | FK → subscriptions |
-| event_type | TEXT | ATTEMPT_FAILED, PAYMENT_SUCCEEDED, PAYMENT_FAILED, REMINDER |
-| delivery_class | TEXT | IMMEDIATE / DELAYED |
-| payload | JSONB | Datos del evento (incluye attemptCount) |
-| idempotency_key | TEXT | UNIQUE — evita duplicados |
-| status | TEXT | PENDING → PUBLISHED |
+> **Nota:** Ya no existe la tabla `notification_outbox`. Las notificaciones las publica cada dominio directamente a Kafka.
 
 ---
 
@@ -636,25 +661,15 @@ Transactional outbox para notificaciones al usuario.
 | Temporal gRPC | 7233 | Servidor Temporal |
 | Temporal UI | 8233 | http://localhost:8233 |
 | API REST | 3000 | http://localhost:3000 |
+| Kafka | 9092 | Tópico: `notifications` |
 
----
+### Variables de entorno opcionales
 
-## Notas de Producción vs PoC
-
-| Aspecto | PoC | Producción |
-|---------|-----|-----------|
-| Retry delay | 1 minuto | 1 día |
-| executeCharge | Simulado (80% éxito) | Integración real con biller |
-| Scheduler | Polling simple + recovery | SKIP LOCKED + múltiples instancias + partitioning |
-| Outbox consumer | Kafka real (tópico: notifications) | CDC/Debezium → múltiples tópicos particionados |
-| Auth | Sin autenticación | JWT / API Gateway |
-| Observabilidad | Console.log | OpenTelemetry + Datadog |
-| Cancelación | Via workflow ID del día | Via Search Attributes (buscar workflows activos por sub_id) |
-| max_retries | Configurable por subscription | Configurable por tipo + overrides por usuario |
-| Servicios | Monolito (todo en un proceso) | Microservicios separados por dominio |
-| Outbox consumer | Polling + Kafka (tópico único) | CDC/Debezium → Kafka → N tópicos + consumers |
-| Signals | Via API REST endpoint | Via Temporal client SDK directo |
-| Search Attributes | No usados en PoC | userId, customerId, billerId, subscriptionType, amount range, region |
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `KAFKA_BROKER` | `localhost:9092` | Broker de Kafka |
+| `KAFKA_TOPIC` | `notifications` | Tópico donde se publican los eventos |
+| `PLATFORM_API_URL` | `http://localhost:3000` | URL del API server (no usado actualmente) |
 
 ---
 
@@ -669,7 +684,7 @@ sequenceDiagram
     participant U as Soporte/Admin
     participant API as API Server
     participant T as Temporal
-    participant W as billPaymentWorkflow<br/>(sleeping 1 día)
+    participant W as billPaymentWorkflow<br/>(sleeping 1 min)
 
     U->>API: POST /workflows/:id/signal/updateAmount {amount: 75}
     API->>T: handle.signal('updateAmount', 75)
@@ -692,126 +707,134 @@ curl http://localhost:3000/workflows/{wfId}/query/progress
 
 **Caso de uso:** Dashboard de ops muestra estado real-time de cada cobro sin consultar la BD.
 
-> **Nota:** En producción se recomienda agregar [Search Attributes](https://docs.temporal.io/visibility#search-attribute) (`userId`, `subscriptionType`, etc.) para buscar workflows por datos de negocio. Se omitieron en este PoC por simplicidad.
-
 ---
 
-## Outbox Consumer
+## Kafka — Eventos de Notificación
 
-El outbox consumer cierra el ciclo de eventos. Hace polling a `notification_outbox` y publica a Kafka (tópico: `notifications`):
+Cada dominio publica sus eventos directamente al tópico `notifications` via una activity de Temporal.
 
-**Requisitos:** Kafka corriendo en `localhost:9092` con el tópico `notifications` creado.
-
-```bash
-npm run start:outbox
-```
-
-Output:
-```
-🔌 Kafka producer connected → broker: localhost:9092, topic: notifications
-📬 Outbox Consumer started — polling every 2s
-   Publishing to Kafka topic: notifications
-
-  📤 [PAYMENT_SUCCEEDED] → Kafka topic:notifications
-     key: df386204-8059-...
-     payload: {"result":"SUCCESS","attemptCount":1}
-     idempotency_key: df386204-...-PAYMENT_SUCCEEDED
-
-  📤 [ATTEMPT_FAILED] → Kafka topic:notifications
-     key: 63846306-702b-...
-     payload: {"attempt":1,"maxAttempts":3,"nextRetryIn":"1 day"}
-```
-
-### Mensaje Kafka
-
-Cada mensaje publicado al tópico `notifications` tiene:
-- **Key:** `subscriptionId` (para particionado por suscripción)
-- **Value (JSON):**
+### Estructura del mensaje
 
 ```json
 {
-  "id": "uuid-del-outbox-row",
+  "domain": "bill",
   "subscriptionId": "uuid-de-la-suscripcion",
-  "eventType": "PAYMENT_SUCCEEDED | PAYMENT_FAILED | ATTEMPT_FAILED | SUBSCRIPTION_SUSPENDED",
-  "deliveryClass": "IMMEDIATE | DELAYED",
-  "payload": { "...datos del evento..." },
-  "idempotencyKey": "subscription-date-eventType",
-  "createdAt": "2024-01-15T10:00:00Z",
-  "publishedAt": "2024-01-15T10:00:01Z"
+  "eventType": "PAYMENT_SUCCEEDED | PAYMENT_FAILED | ATTEMPT_FAILED",
+  "payload": {
+    "amount": 89.90,
+    "attempt": 1,
+    "destinationId": "biller-claro"
+  },
+  "publishedAt": "2026-07-09T14:00:01Z"
 }
 ```
 
-### Variables de entorno opcionales
+### Eventos por dominio
 
-| Variable | Default | Descripción |
-|----------|---------|-------------|
-| `KAFKA_BROKER` | `localhost:9092` | Broker de Kafka |
-| `KAFKA_TOPIC` | `notifications` | Tópico donde se publican los eventos |
+| Dominio | Evento | Cuándo se publica |
+|---------|--------|-------------------|
+| Bill | `PAYMENT_SUCCEEDED` | Cobro exitoso (en cualquier intento) |
+| Bill | `PAYMENT_FAILED` | Biller inválido o agotó todos los reintentos |
+| Bill | `ATTEMPT_FAILED` | Un intento falló, se reintentará |
+| P2P | `PAYMENT_SUCCEEDED` | Transferencia exitosa |
+| P2P | `PAYMENT_FAILED` | Recipient inválido o agotó reintentos |
+| P2P | `ATTEMPT_FAILED` | Una transferencia falló, se reintentará |
+
+### Key de particionado
+
+`subscriptionId` — garantiza que todos los eventos de una misma suscripción lleguen a la misma partición (orden garantizado por suscripción).
+
+### ¿Por qué activities y no outbox?
+
+| Aspecto | Outbox (anterior) | Activity directa (actual) |
+|---------|-------------------|--------------------------|
+| Consistencia | Transaccional (mismo commit) | Eventual (Temporal garantiza ejecución) |
+| Complejidad | Tabla + publisher + polling | Solo una activity |
+| Acoplamiento | Domains dependen de Platform | Domains son autónomos |
+| Retry | Publisher propio | Temporal retry policy |
+| Duplicados | Idempotency key en BD | Temporal activity dedup (idempotente por workflow history) |
+
+Temporal garantiza que si la activity `publishBillEvent` falla, se reintenta automáticamente. Si el workflow completa, la activity se ejecutó exitosamente.
 
 ---
 
 ## Comunicación entre Servicios
 
-En producción, el **child workflow** vive en un servicio diferente al platform. La regla es:
-
-> **Solo el servicio dueño de la BD escribe en ella.** Los child workflows usan la API interna del platform para efectos colaterales.
+En esta arquitectura, los dominios son **completamente independientes** de Platform:
 
 ```mermaid
 flowchart LR
     subgraph MS_PLATFORM["ms-payment-subscriptions"]
-        API[API REST<br/>+ endpoints internos]
+        API[API REST]
         PW[Platform Worker]
         SCH[Scheduler]
         DB[(PostgreSQL)]
     end
 
-    subgraph MS_BILL["ms-bill-payments"]
+    subgraph MS_BILL["ms-bill-payments (autónomo)"]
         BW[Bill Worker]
-        BILLER[Biller Integration]
+        BILLER[Biller API]
+        BK[Kafka Producer]
+    end
+
+    subgraph MS_P2P["ms-p2p-payments (autónomo)"]
+        PW2[P2P Worker]
+        WALLET[Core Banking]
+        PK[Kafka Producer]
+    end
+
+    subgraph KAFKA["Kafka"]
+        TOPIC[notifications]
     end
 
     PW -->|"executeChild<br/>(task queue: payments-bill)"| BW
-    BW -->|"HTTP POST<br/>/internal/attempt-failed"| API
+    PW -->|"executeChild<br/>(task queue: payments-p2p)"| PW2
     BW -->|"return { status, attemptCount }"| PW
+    PW2 -->|"return { status, attemptCount }"| PW
     PW -->|"recordPaymentResult<br/>(direct DB access)"| DB
-    API --> DB
     BW --> BILLER
-```
-
-### Endpoints internos (`/internal/*`)
-
-Estos endpoints son llamados por los child workflows en otros servicios:
-
-| Método | Endpoint | Propósito |
-|--------|----------|-----------|
-| POST | `/internal/attempt-failed` | Notificar un intento fallido (escribe a outbox) |
-
-```bash
-# Ejemplo: child workflow notifica un fallo
-curl -X POST http://ms-payment-subscriptions/internal/attempt-failed \
-  -H "Content-Type: application/json" \
-  -d '{
-    "subscriptionId": "43a05e07-...",
-    "attempt": 1,
-    "maxAttempts": 3,
-    "nextRetryIn": "1 day"
-  }'
+    BW --> BK
+    PW2 --> WALLET
+    PW2 --> PK
+    BK --> TOPIC
+    PK --> TOPIC
+    API --> DB
 ```
 
 ### Responsabilidades por servicio
 
-| Servicio | Responsabilidad | Acceso a BD |
-|----------|----------------|-------------|
-| **ms-payment-subscriptions** | Orquestación, scheduling, state management, outbox | ✅ Directo |
-| **ms-bill-payments** | Validar biller, ejecutar cobro, notificar fallos via API | ❌ Solo via HTTP |
-| **ms-p2p-payments** (futuro) | Ejecutar transferencia P2P | ❌ Solo via HTTP |
+| Servicio | Responsabilidad | Acceso a BD Platform | Publica a Kafka |
+|----------|----------------|---------------------|-----------------|
+| **ms-payment-subscriptions** | Scheduling, lifecycle, state management | ✅ Directo | ❌ No |
+| **ms-bill-payments** | Validar biller, ejecutar cobro, notificar | ❌ No | ✅ Sí |
+| **ms-p2p-payments** | Validar wallet, ejecutar transferencia, notificar | ❌ No | ✅ Sí |
 
 ### ¿Por qué este patrón?
 
-1. **Ownership de datos** — Solo un servicio modifica su BD (evita distributed transactions)
-2. **Contrato explícito** — Los endpoints internos definen qué puede hacer un child
-3. **Independencia de deploy** — El child no necesita conocer el schema de la BD
-4. **Testability** — En tests del child, mockeas HTTP; no necesitas BD del platform
+1. **Autonomía total** — Cada dominio ejecuta y notifica sin depender de Platform
+2. **Zero HTTP callbacks** — Los child workflows no llaman APIs externas para notificar
+3. **Ownership de datos** — Solo Platform modifica su BD; solo cada dominio decide qué publicar
+4. **Testability** — Testing del child no requiere mockear APIs ni BD externas
+5. **Independencia de deploy** — Platform puede deployar sin afectar a Bill o P2P y viceversa
+
+---
+
+## Notas de Producción vs PoC
+
+| Aspecto | PoC | Producción |
+|---------|-----|-----------|
+| Retry delay | 1 minuto | 1 día |
+| executeCharge | Simulado (80% éxito) | Integración real con biller |
+| Scheduler | Polling simple + recovery | SKIP LOCKED + múltiples instancias + partitioning |
+| Kafka | Tópico único (`notifications`) | Múltiples tópicos por dominio + Schema Registry |
+| Auth | Sin autenticación | JWT / API Gateway |
+| Observabilidad | Console.log | OpenTelemetry + Datadog |
+| Cancelación | Via workflow ID del día | Via Search Attributes (buscar workflows activos por sub_id) |
+| max_retries | Configurable por subscription | Configurable por tipo + overrides por usuario |
+| Servicios | Monolito (todo en un proceso) | Microservicios separados por dominio |
+| Signals | Via API REST endpoint | Via Temporal client SDK directo |
+| Search Attributes | No usados en PoC | userId, customerId, billerId, subscriptionType, amount range, region |
+| Kafka producer | Un producer compartido por worker | Producer pool con circuit breaker + DLQ |
 
 ---
 
@@ -833,12 +856,13 @@ curl -X POST http://ms-payment-subscriptions/internal/attempt-failed \
 
 Se pueden combinar: retry rápido en child (horas) + re-enqueue externo (días).
 
-### 3. ¿Outbox consumer como Temporal worker o Kafka consumer?
+### 3. ¿Tópico único o múltiples tópicos?
 
 | Opción | Descripción | Recomendación |
 |--------|-------------|---------------|
-| **A) Kafka consumer** ✅ | CDC/polling → Kafka → múltiples consumers (email, push, analytics) | Estándar, desacoplado, replay |
-| **B) Temporal worker** | Otro workflow que hace polling a la outbox | Más simple pero acopla dominios |
+| **A) Tópico único** (esta PoC) | Todos publican a `notifications` | Simple para PoC, suficiente con pocos consumers |
+| **B) Tópicos por dominio** | `bill.events`, `p2p.events`, `subscriptions.lifecycle` | Mejor routing, retention policies distintas |
+| **C) Tópicos por evento** | `payment.succeeded`, `payment.failed`, `attempt.failed` | Máxima granularidad, consumers específicos |
 
 ### 4. ¿Temporal namespace compartido o dedicado?
 
@@ -864,5 +888,6 @@ Se pueden combinar: retry rápido en child (horas) + re-enqueue externo (días).
 | Signal/Query devuelve 404 | El workflow ya terminó | Crea más subscriptions para tener uno en retry-sleep |
 | `ALREADY_EXISTS` en scheduler | Workflow ya fue creado para ese día | Correcto — el scheduler lo maneja como idempotente (skip) |
 | `WorkflowTaskFailed` (non-determinism) | Cambiaste código de un workflow con ejecuciones activas | Termina los workflows viejos: `temporal workflow terminate --workflow-id X` |
-| Outbox consumer no muestra eventos | Los workflows aún no escribieron al outbox | Espera a que un workflow complete (éxito o fallo) |
+| Bill/P2P Worker no publica a Kafka | Kafka no está corriendo o tópico no existe | Verifica Kafka en `localhost:9092` con tópico `notifications` |
 | P2P workflow no ejecuta | P2P Worker no está corriendo | Levanta `npm run start:worker:p2p` |
+| `KafkaJSConnectionError` | Kafka broker no alcanzable | Verifica que Kafka esté en `localhost:9092` |
