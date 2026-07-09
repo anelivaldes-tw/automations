@@ -1,4 +1,6 @@
 -- PAD 213 PoC - Database Schema
+-- Platform tables: subscription lifecycle + execution queue
+-- Notifications are handled by each domain (child workflows publish to Kafka directly)
 
 CREATE TABLE IF NOT EXISTS subscriptions (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -30,19 +32,5 @@ CREATE TABLE IF NOT EXISTS payment_execution_queue (
     updated_at      TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS notification_outbox (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    subscription_id UUID NOT NULL REFERENCES subscriptions(id),
-    event_type      TEXT NOT NULL,  -- 'PAYMENT_SUCCEEDED', 'PAYMENT_FAILED', 'REMINDER'
-    delivery_class  TEXT NOT NULL DEFAULT 'IMMEDIATE',  -- 'IMMEDIATE', 'DELAYED'
-    payload         JSONB NOT NULL DEFAULT '{}',
-    status          TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING, PUBLISHED
-    idempotency_key TEXT UNIQUE NOT NULL,
-    scheduled_for   TIMESTAMPTZ,
-    published_at    TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ DEFAULT now()
-);
-
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_queue_ready ON payment_execution_queue(due_at) WHERE status = 'READY';
-CREATE INDEX IF NOT EXISTS idx_outbox_pending ON notification_outbox(delivery_class, status) WHERE status = 'PENDING';

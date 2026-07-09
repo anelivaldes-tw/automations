@@ -40,18 +40,6 @@ app.post('/subscriptions', async (req, res) => {
       [sub.id, subscriptionType || 'BILL', sub.next_execution_at]
     );
 
-    // Write reminder to outbox
-    await client.query(
-      `INSERT INTO notification_outbox (subscription_id, event_type, delivery_class, payload, idempotency_key, scheduled_for)
-       VALUES ($1, 'REMINDER', 'DELAYED', $2, $3, $4)`,
-      [
-        sub.id,
-        JSON.stringify({ message: 'Your automatic payment will execute soon' }),
-        `${sub.id}-reminder-first`,
-        sub.next_execution_at,
-      ]
-    );
-
     await client.query('COMMIT');
 
     console.log(`✅ Subscription created: ${sub.id} (type: ${subscriptionType || 'BILL'})`);
@@ -103,47 +91,10 @@ app.get('/subscriptions', async (_req, res) => {
   res.json(result.rows);
 });
 
-// GET /outbox — See notification events
-app.get('/outbox', async (_req, res) => {
-  const result = await pool.query('SELECT * FROM notification_outbox ORDER BY created_at DESC');
-  res.json(result.rows);
-});
-
 // GET /queue — See execution queue
 app.get('/queue', async (_req, res) => {
   const result = await pool.query('SELECT * FROM payment_execution_queue ORDER BY created_at DESC');
   res.json(result.rows);
-});
-
-// --- Internal endpoints (called by child workflows in other services) ---
-
-// POST /internal/attempt-failed — Child workflow notifies a failed attempt
-app.post('/internal/attempt-failed', async (req, res) => {
-  const { subscriptionId, attempt, maxAttempts, nextRetryIn } = req.body;
-  const idempotencyKey = `${subscriptionId}-attempt-${attempt}-failed`;
-
-  try {
-    await pool.query(
-      `INSERT INTO notification_outbox (subscription_id, event_type, delivery_class, payload, idempotency_key)
-       VALUES ($1, 'ATTEMPT_FAILED', 'IMMEDIATE', $2, $3)
-       ON CONFLICT (idempotency_key) DO NOTHING`,
-      [
-        subscriptionId,
-        JSON.stringify({
-          message: `Tu pago falló (intento ${attempt}/${maxAttempts}). Reintentaremos en ${nextRetryIn}.`,
-          attempt,
-          maxAttempts,
-          nextRetryIn,
-        }),
-        idempotencyKey,
-      ]
-    );
-    console.log(`[internal/attempt-failed] ${subscriptionId} → attempt ${attempt} → outbox written ✅`);
-    res.json({ ok: true });
-  } catch (err: any) {
-    console.error('[internal/attempt-failed] Error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
 });
 
 // --- Signal & Query endpoints (interact with running workflows) ---
@@ -244,9 +195,8 @@ app.listen(PORT, () => {
   console.log(`   POST /subscriptions  — create a subscription`);
   console.log(`   GET  /subscriptions  — list all`);
   console.log(`   GET  /queue          — see execution queue`);
-  console.log(`   GET  /outbox         — see notifications`);
   console.log(`   POST /workflows/:id/signal/updateAmount`);
   console.log(`   GET  /workflows/:id/query/progress`);
   console.log(`   GET  /workflows/:id/query/status`);
-  console.log(`   GET  /workflows/search?userId=X&subscriptionType=Y`);
+  console.log(`   GET  /workflows/search?workflowType=X&status=Y`);
 });

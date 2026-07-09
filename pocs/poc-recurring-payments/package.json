@@ -6,13 +6,12 @@
   "scripts": {
     "build": "tsc",
     "db:setup": "ts-node src/db/setup.ts",
-    "db:reset": "docker exec poc-recurring-payments-postgres psql -U postgres -d recurring_payments -c 'TRUNCATE subscriptions, payment_execution_queue, notification_outbox CASCADE;'",
+    "db:reset": "docker exec poc-recurring-payments-postgres psql -U postgres -d recurring_payments -c 'TRUNCATE subscriptions, payment_execution_queue CASCADE;'",
     "start:api": "ts-node src/api/server.ts",
     "start:scheduler": "ts-node src/scheduler/dispatcher.ts",
     "start:worker:platform": "ts-node src/workers/platform.worker.ts",
     "start:worker:bill": "ts-node src/workers/bill.worker.ts",
     "start:worker:p2p": "ts-node src/workers/p2p.worker.ts",
-    "start:outbox": "ts-node src/outbox/consumer.ts",
     "test:create": "ts-node src/scripts/create-subscription.ts"
   },
   "dependencies": {

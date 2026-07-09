@@ -1,15 +1,16 @@
 import { Worker } from '@temporalio/worker';
-import * as activities from '../activities';
+import * as p2pActivities from '../activities/p2p.activities';
 import * as path from 'path';
 
 async function run() {
   const worker = await Worker.create({
     workflowsPath: path.resolve(__dirname, '../workflows'),
-    activities,
+    activities: p2pActivities,
     taskQueue: 'payments-p2p',
   });
 
   console.log('🚀 P2P Worker started (task queue: payments-p2p)');
+  console.log('   Activities: validateP2PRecipient, executeP2PTransfer, publishP2PEvent');
   await worker.run();
 }
 

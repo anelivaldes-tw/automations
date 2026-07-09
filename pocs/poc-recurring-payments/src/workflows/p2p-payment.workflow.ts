@@ -4,7 +4,7 @@ import type { PaymentExecutionInput } from './recurring-payment.workflow';
 const activities = proxyActivities<{
   validateP2PRecipient: (destinationId: string) => Promise<boolean>;
   executeP2PTransfer: (amount: number, destinationId: string) => Promise<string>;
-  notifyAttemptFailed: (input: { subscriptionId: string; attempt: number; maxAttempts: number; nextRetryIn: string }) => Promise<void>;
+  publishP2PEvent: (input: { subscriptionId: string; eventType: string; payload: Record<string, unknown> }) => Promise<void>;
 }>({
   startToCloseTimeout: '10s',
   retry: { maximumAttempts: 1 },
@@ -20,8 +20,7 @@ export interface P2PPaymentResult {
 /**
  * P2P Payment Child Workflow
  * Transfers money between Yape users (e.g., recurring allowance to family member).
- * Simpler than BILL: validates recipient wallet, executes transfer.
- * Same retry/cancellation patterns as BILL to demonstrate strategy reuse.
+ * Owns its notifications end-to-end — publishes directly to Kafka.
  */
 export async function p2pPaymentWorkflow(input: PaymentExecutionInput): Promise<P2PPaymentResult> {
   const maxAttempts = input.maxRetries || 3;
@@ -31,6 +30,11 @@ export async function p2pPaymentWorkflow(input: PaymentExecutionInput): Promise<
   const valid = await activities.validateP2PRecipient(input.destinationId);
   if (!valid) {
     console.log(`[P2P] ❌ Recipient ${input.destinationId} not found or inactive`);
+    await activities.publishP2PEvent({
+      subscriptionId: input.subscriptionId,
+      eventType: 'PAYMENT_FAILED',
+      payload: { reason: 'INVALID_RECIPIENT', destinationId: input.destinationId },
+    });
     return { status: 'FAILED', attemptCount: 0 };
   }
 
@@ -43,16 +47,25 @@ export async function p2pPaymentWorkflow(input: PaymentExecutionInput): Promise<
 
       if (result === 'SUCCESS') {
         console.log(`[P2P] ✅ Transfer successful on attempt ${attempt}`);
+        await activities.publishP2PEvent({
+          subscriptionId: input.subscriptionId,
+          eventType: 'PAYMENT_SUCCEEDED',
+          payload: { amount: input.amount, attempt, destinationId: input.destinationId },
+        });
         return { status: 'SUCCESS', attemptCount: attempt };
       }
 
       // Failed — notify and retry
       if (attempt < maxAttempts) {
-        await activities.notifyAttemptFailed({
+        await activities.publishP2PEvent({
           subscriptionId: input.subscriptionId,
-          attempt,
-          maxAttempts,
-          nextRetryIn: RETRY_DELAY,
+          eventType: 'ATTEMPT_FAILED',
+          payload: {
+            attempt,
+            maxAttempts,
+            nextRetryIn: RETRY_DELAY,
+            message: `Tu transferencia falló (intento ${attempt}/${maxAttempts}). Reintentaremos en ${RETRY_DELAY}.`,
+          },
         });
         console.log(`[P2P] ⏳ Transfer failed, retrying in ${RETRY_DELAY}...`);
         await sleep(RETRY_DELAY);
@@ -67,5 +80,11 @@ export async function p2pPaymentWorkflow(input: PaymentExecutionInput): Promise<
   }
 
   console.log(`[P2P] ❌ All ${maxAttempts} attempts exhausted`);
+  // Notify final failure
+  await activities.publishP2PEvent({
+    subscriptionId: input.subscriptionId,
+    eventType: 'PAYMENT_FAILED',
+    payload: { amount: input.amount, attempts: maxAttempts, destinationId: input.destinationId },
+  });
   return { status: 'FAILED', attemptCount: maxAttempts };
 }

@@ -6,7 +6,7 @@ const RETRY_DELAY = '1 minute'; // En producción: '1 day'
 const activities = proxyActivities<{
   validateBiller: (destinationId: string) => Promise<boolean>;
   executeCharge: (amount: number, destinationId: string) => Promise<string>;
-  notifyAttemptFailed: (input: { subscriptionId: string; attempt: number; maxAttempts: number; nextRetryIn: string }) => Promise<void>;
+  publishBillEvent: (input: { subscriptionId: string; eventType: string; payload: Record<string, unknown> }) => Promise<void>;
 }>({
   startToCloseTimeout: '15s',
   retry: { maximumAttempts: 1 },
@@ -59,6 +59,11 @@ export async function billPaymentWorkflow(input: PaymentExecutionInput): Promise
   const valid = await activities.validateBiller(input.destinationId);
   if (!valid) {
     status = 'COMPLETED';
+    await activities.publishBillEvent({
+      subscriptionId: input.subscriptionId,
+      eventType: 'PAYMENT_FAILED',
+      payload: { reason: 'INVALID_BILLER', destinationId: input.destinationId },
+    });
     return { status: 'FAILED', attemptCount: 0 };
   }
 
@@ -75,16 +80,26 @@ export async function billPaymentWorkflow(input: PaymentExecutionInput): Promise
       if (chargeResult === 'SUCCESS') {
         console.log(`[BillPayment] ✅ Success on attempt ${attempt}`);
         status = 'COMPLETED';
+        // Notify success to Kafka
+        await activities.publishBillEvent({
+          subscriptionId: input.subscriptionId,
+          eventType: 'PAYMENT_SUCCEEDED',
+          payload: { amount: currentAmount, attempt, destinationId: input.destinationId },
+        });
         return { status: 'SUCCESS', attemptCount: attempt };
       }
 
-      // Failed — notify user via outbox
+      // Failed — notify user via Kafka and retry
       if (attempt < maxAttempts) {
-        await activities.notifyAttemptFailed({
+        await activities.publishBillEvent({
           subscriptionId: input.subscriptionId,
-          attempt,
-          maxAttempts,
-          nextRetryIn: RETRY_DELAY,
+          eventType: 'ATTEMPT_FAILED',
+          payload: {
+            attempt,
+            maxAttempts,
+            nextRetryIn: RETRY_DELAY,
+            message: `Tu pago falló (intento ${attempt}/${maxAttempts}). Reintentaremos en ${RETRY_DELAY}.`,
+          },
         });
 
         status = 'WAITING_RETRY';
@@ -103,5 +118,11 @@ export async function billPaymentWorkflow(input: PaymentExecutionInput): Promise
 
   console.log(`[BillPayment] ❌ All ${maxAttempts} attempts exhausted`);
   status = 'COMPLETED';
+  // Notify final failure to Kafka
+  await activities.publishBillEvent({
+    subscriptionId: input.subscriptionId,
+    eventType: 'PAYMENT_FAILED',
+    payload: { amount: currentAmount, attempts: maxAttempts, destinationId: input.destinationId },
+  });
   return { status: 'FAILED', attemptCount: maxAttempts };
 }
