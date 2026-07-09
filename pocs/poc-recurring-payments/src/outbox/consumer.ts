@@ -1,19 +1,29 @@
 import { pool } from '../db/pool';
+import { connectProducer, publishEvent, disconnectProducer } from '../kafka/producer';
 
 const POLL_INTERVAL_MS = 2000;
 const BATCH_SIZE = 20;
 
 /**
- * Outbox Consumer — polls notification_outbox and "publishes" events.
- * In production: this would be a CDC/Debezium connector or a Kafka producer.
- * Here it simulates publishing by logging and marking as PUBLISHED.
+ * Outbox Consumer — polls notification_outbox and publishes events to Kafka topic "notifications".
+ * Uses transactional outbox pattern: claim → publish to Kafka → mark as PUBLISHED.
  */
 async function consume() {
+  await connectProducer();
+
   console.log('📬 Outbox Consumer started — polling every 2s');
-  console.log('   In production: this publishes to Kafka/SQS for downstream consumers');
-  console.log('   (email service, push notifications, analytics, audit trail)\n');
+  console.log('   Publishing to Kafka topic: notifications\n');
 
   let totalPublished = 0;
+
+  // Graceful shutdown
+  const shutdown = async () => {
+    console.log('\n📬 Shutting down outbox consumer...');
+    await disconnectProducer();
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 
   while (true) {
     try {
@@ -35,15 +45,24 @@ async function consume() {
         for (const event of res.rows) {
           totalPublished++;
           const payload = typeof event.payload === 'string' ? JSON.parse(event.payload) : event.payload;
-          
-          // Simulate routing to different consumers based on event_type
-          const consumer = getConsumer(event.event_type);
-          
-          console.log(`  📤 [${event.event_type}] → ${consumer}`);
-          console.log(`     subscription: ${event.subscription_id}`);
+
+          const kafkaMessage = {
+            id: event.id,
+            subscriptionId: event.subscription_id,
+            eventType: event.event_type,
+            deliveryClass: event.delivery_class,
+            payload,
+            idempotencyKey: event.idempotency_key,
+            createdAt: event.created_at,
+            publishedAt: new Date().toISOString(),
+          };
+
+          await publishEvent(event.subscription_id, kafkaMessage);
+
+          console.log(`  📤 [${event.event_type}] → Kafka topic:notifications`);
+          console.log(`     key: ${event.subscription_id}`);
           console.log(`     payload: ${JSON.stringify(payload)}`);
           console.log(`     idempotency_key: ${event.idempotency_key}`);
-          console.log(`     delivery: ${event.delivery_class} | published_at: ${new Date().toISOString()}`);
           console.log('');
         }
 
@@ -55,19 +74,6 @@ async function consume() {
 
     await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
   }
-}
-
-/**
- * Simulates routing events to different downstream consumers
- */
-function getConsumer(eventType: string): string {
-  const routes: Record<string, string> = {
-    'PAYMENT_SUCCEEDED': 'kafka://payments.events → [ms-notifications (push), ms-analytics (metrics)]',
-    'PAYMENT_FAILED': 'kafka://payments.events → [ms-notifications (push + email), ms-support (alert)]',
-    'ATTEMPT_FAILED': 'kafka://payments.retries → [ms-notifications (push: "reintentaremos mañana")]',
-    'SUBSCRIPTION_SUSPENDED': 'kafka://subscriptions.lifecycle → [ms-notifications (email), ms-crm (churn risk)]',
-  };
-  return routes[eventType] || `kafka://payments.unknown → [unrouted]`;
 }
 
 consume().catch(console.error);

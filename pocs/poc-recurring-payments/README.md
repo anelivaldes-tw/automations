@@ -64,8 +64,12 @@ flowchart TD
         W_P2P[P2P Worker<br/>task queue: payments-p2p]
     end
 
+    subgraph KAFKA["Kafka (localhost:9092)"]
+        TOPIC[topic: notifications]
+    end
+
     subgraph OUTBOX_CONSUMER["Outbox Consumer"]
-        OC[Polling consumer<br/>→ simulated Kafka publish]
+        OC[Polling consumer<br/>→ Kafka producer]
     end
 
     POST -->|"TX atómica"| SUBS
@@ -91,6 +95,7 @@ flowchart TD
     WF_P -->|"recordPaymentResult<br/>(TX atómica + re-enqueue)"| DB
     WF_BILL -->|"notifyAttemptFailed<br/>(HTTP → platform API)"| OUTBOX
     OC -->|"poll PENDING → mark PUBLISHED"| OUTBOX
+    OC -->|"publish events"| TOPIC
 ```
 
 ---
@@ -241,7 +246,7 @@ El `sleep()` de Temporal es **cancellation-aware**: cuando se cancela el workflo
 | **Signals** | `updateAmount` permite cambiar el monto de cobro mientras el workflow está en retry-sleep |
 | **Queries** | `getProgress` inspecciona el estado del child sin bloquearlo (attempt, amount, status) |
 | **Workflow search** | Buscar workflows por tipo y estado via API y Temporal CLI |
-| **Outbox Consumer** | Polling → publicación simulada a Kafka con routing por event_type |
+| **Outbox Consumer** | Polling → publicación real a Kafka (tópico: `notifications`) |
 | **Multi-strategy children** | BILL (cobro a biller) y P2P (transferencia wallet-to-wallet) como workflows separados |
 | **Scheduler recovery** | Rows stuck en PROCESSING >5 min se liberan automáticamente |
 | **Workflow timeout** | `workflowExecutionTimeout: '4 days'` previene workflows zombie |
@@ -557,7 +562,9 @@ src/
 │   ├── schema.sql             # DDL: subscriptions, payment_execution_queue, notification_outbox
 │   └── setup.ts               # Script para crear el schema
 ├── outbox/
-│   └── consumer.ts            # Outbox consumer — polling + simulated Kafka publish
+│   └── consumer.ts            # Outbox consumer — polling + Kafka publish (topic: notifications)
+├── kafka/
+│   └── producer.ts            # Kafka producer (kafkajs) — conexión y publish helper
 ├── scheduler/
 │   └── dispatcher.ts          # Poller: claim queue rows → start workflows + recovery
 ├── scripts/
@@ -639,13 +646,13 @@ Transactional outbox para notificaciones al usuario.
 | Retry delay | 1 minuto | 1 día |
 | executeCharge | Simulado (80% éxito) | Integración real con biller |
 | Scheduler | Polling simple + recovery | SKIP LOCKED + múltiples instancias + partitioning |
-| Outbox consumer | No implementado | Kafka/SQS consumer que publica eventos |
+| Outbox consumer | Kafka real (tópico: notifications) | CDC/Debezium → múltiples tópicos particionados |
 | Auth | Sin autenticación | JWT / API Gateway |
 | Observabilidad | Console.log | OpenTelemetry + Datadog |
 | Cancelación | Via workflow ID del día | Via Search Attributes (buscar workflows activos por sub_id) |
 | max_retries | Configurable por subscription | Configurable por tipo + overrides por usuario |
 | Servicios | Monolito (todo en un proceso) | Microservicios separados por dominio |
-| Outbox consumer | Polling + console.log | CDC/Debezium → Kafka → N consumers |
+| Outbox consumer | Polling + Kafka (tópico único) | CDC/Debezium → Kafka → N tópicos + consumers |
 | Signals | Via API REST endpoint | Via Temporal client SDK directo |
 | Search Attributes | No usados en PoC | userId, customerId, billerId, subscriptionType, amount range, region |
 
@@ -691,7 +698,9 @@ curl http://localhost:3000/workflows/{wfId}/query/progress
 
 ## Outbox Consumer
 
-El outbox consumer cierra el ciclo de eventos. Hace polling a `notification_outbox` y simula la publicación a Kafka:
+El outbox consumer cierra el ciclo de eventos. Hace polling a `notification_outbox` y publica a Kafka (tópico: `notifications`):
+
+**Requisitos:** Kafka corriendo en `localhost:9092` con el tópico `notifications` creado.
 
 ```bash
 npm run start:outbox
@@ -699,25 +708,45 @@ npm run start:outbox
 
 Output:
 ```
+🔌 Kafka producer connected → broker: localhost:9092, topic: notifications
 📬 Outbox Consumer started — polling every 2s
-  📤 [PAYMENT_SUCCEEDED] → kafka://payments.events → [ms-notifications (push), ms-analytics (metrics)]
-     subscription: df386204-8059-...
+   Publishing to Kafka topic: notifications
+
+  📤 [PAYMENT_SUCCEEDED] → Kafka topic:notifications
+     key: df386204-8059-...
      payload: {"result":"SUCCESS","attemptCount":1}
      idempotency_key: df386204-...-PAYMENT_SUCCEEDED
 
-  📤 [ATTEMPT_FAILED] → kafka://payments.retries → [ms-notifications (push: "reintentaremos mañana")]
-     subscription: 63846306-702b-...
+  📤 [ATTEMPT_FAILED] → Kafka topic:notifications
+     key: 63846306-702b-...
      payload: {"attempt":1,"maxAttempts":3,"nextRetryIn":"1 day"}
 ```
 
-### Routing por event_type
+### Mensaje Kafka
 
-| Event Type | Kafka Topic | Consumers |
-|-----------|-------------|-----------|
-| `PAYMENT_SUCCEEDED` | `payments.events` | ms-notifications (push), ms-analytics |
-| `PAYMENT_FAILED` | `payments.events` | ms-notifications (push+email), ms-support (alert) |
-| `ATTEMPT_FAILED` | `payments.retries` | ms-notifications (push: "reintentaremos mañana") |
-| `SUBSCRIPTION_SUSPENDED` | `subscriptions.lifecycle` | ms-notifications (email), ms-crm (churn risk) |
+Cada mensaje publicado al tópico `notifications` tiene:
+- **Key:** `subscriptionId` (para particionado por suscripción)
+- **Value (JSON):**
+
+```json
+{
+  "id": "uuid-del-outbox-row",
+  "subscriptionId": "uuid-de-la-suscripcion",
+  "eventType": "PAYMENT_SUCCEEDED | PAYMENT_FAILED | ATTEMPT_FAILED | SUBSCRIPTION_SUSPENDED",
+  "deliveryClass": "IMMEDIATE | DELAYED",
+  "payload": { "...datos del evento..." },
+  "idempotencyKey": "subscription-date-eventType",
+  "createdAt": "2024-01-15T10:00:00Z",
+  "publishedAt": "2024-01-15T10:00:01Z"
+}
+```
+
+### Variables de entorno opcionales
+
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `KAFKA_BROKER` | `localhost:9092` | Broker de Kafka |
+| `KAFKA_TOPIC` | `notifications` | Tópico donde se publican los eventos |
 
 ---
 
