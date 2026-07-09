@@ -1,4 +1,4 @@
-import { proxyActivities, executeChild, defineQuery, setHandler, upsertSearchAttributes } from '@temporalio/workflow';
+import { proxyActivities, executeChild, defineQuery, setHandler } from '@temporalio/workflow';
 import { ChildWorkflowCancellationType } from '@temporalio/workflow';
 import type * as activities from '../activities';
 
@@ -47,14 +47,6 @@ export async function recurringPaymentWorkflow(input: PaymentExecutionInput): Pr
     phase,
     result: finalResult,
   }));
-
-  // Upsert Search Attributes for visibility in Temporal UI / queries
-  upsertSearchAttributes({
-    // Custom search attributes (must be registered in Temporal server)
-    // These allow: `temporal workflow list -q 'userId="user123"'`
-    ...(input.userId ? { userId: [input.userId] } : {}),
-    subscriptionType: [input.subscriptionType],
-  });
 
   // Activity 1: Validate subscription is still active
   const valid = await validateSubscription(input.subscriptionId);

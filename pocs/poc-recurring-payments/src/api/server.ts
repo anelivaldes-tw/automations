@@ -201,17 +201,15 @@ app.get('/workflows/:workflowId/query/status', async (req, res) => {
   }
 });
 
-// GET /workflows/search — Search workflows by custom attributes
+// GET /workflows/search — Search workflows by status/type (built-in attributes)
 app.get('/workflows/search', async (req, res) => {
-  const { userId, subscriptionType, status } = req.query;
+  const { workflowType, status } = req.query;
 
   try {
     const client = await getTemporalClient();
 
-    // Build query from search attributes
     const conditions: string[] = [];
-    if (userId) conditions.push(`userId = "${userId}"`);
-    if (subscriptionType) conditions.push(`subscriptionType = "${subscriptionType}"`);
+    if (workflowType) conditions.push(`WorkflowType = "${workflowType}"`);
     if (status) conditions.push(`ExecutionStatus = "${status}"`);
     
     const query = conditions.length > 0 ? conditions.join(' AND ') : undefined;
@@ -224,7 +222,6 @@ app.get('/workflows/search', async (req, res) => {
         type: wf.type,
         status: wf.status?.name || String(wf.status),
         startTime: wf.startTime,
-        searchAttributes: wf.searchAttributes,
       });
       if (workflows.length >= 50) break;
     }

@@ -25,7 +25,7 @@ En Yape tenemos múltiples tipos de pagos recurrentes (servicios, P2P, top-ups) 
 - [Estructura del Proyecto](#estructura-del-proyecto)
 - [Modelo de Datos](#modelo-de-datos)
 - [Configuración](#configuración)
-- [Signals, Queries y Search Attributes](#signals-queries-y-search-attributes)
+- [Signals y Queries](#signals-y-queries)
 - [Outbox Consumer](#outbox-consumer)
 - [Comunicación entre Servicios](#comunicación-entre-servicios)
 - [Notas de Producción vs PoC](#notas-de-producción-vs-poc)
@@ -53,7 +53,7 @@ flowchart TD
     end
 
     subgraph TEMPORAL["Temporal Server (:7233)"]
-        WF_P[recurringPaymentWorkflow<br/>+ Search Attributes]
+        WF_P[recurringPaymentWorkflow<br/>+ Query]
         WF_BILL[billPaymentWorkflow<br/>+ Signal + Query]
         WF_P2P[p2pPaymentWorkflow]
     end
@@ -77,7 +77,7 @@ flowchart TD
 
     SIGNAL -->|"signal: updateAmount"| WF_BILL
     QUERY -->|"query: getProgress"| WF_BILL
-    SEARCH -->|"Search Attributes"| TEMPORAL
+    SEARCH -->|"list by status/type"| TEMPORAL
 
     SCH[Scheduler<br/>polling 3s] -->|"claim READY rows<br/>+ JOIN subscriptions"| QUEUE
     SCH -->|"startWorkflow<br/>(timeout: 4 days)"| WF_P
@@ -240,7 +240,7 @@ El `sleep()` de Temporal es **cancellation-aware**: cuando se cancela el workflo
 | **Configurable retries** | `max_retries` se lee de BD, no hardcodeado en el workflow |
 | **Signals** | `updateAmount` permite cambiar el monto de cobro mientras el workflow está en retry-sleep |
 | **Queries** | `getProgress` inspecciona el estado del child sin bloquearlo (attempt, amount, status) |
-| **Search Attributes** | `userId` + `subscriptionType` permiten buscar workflows en Temporal UI/API |
+| **Workflow search** | Buscar workflows por tipo y estado via API y Temporal CLI |
 | **Outbox Consumer** | Polling → publicación simulada a Kafka con routing por event_type |
 | **Multi-strategy children** | BILL (cobro a biller) y P2P (transferencia wallet-to-wallet) como workflows separados |
 | **Scheduler recovery** | Rows stuck en PROCESSING >5 min se liberan automáticamente |
@@ -272,11 +272,7 @@ temporal server start-dev --ui-port 8233 --db-filename temporal_poc.db
 # 4. Crear schema de BD
 npm run db:setup
 
-# 5. Registrar Search Attributes en Temporal
-chmod +x scripts/register-search-attributes.sh
-./scripts/register-search-attributes.sh
-
-# 6. Levantar workers y servicios (cada uno en una terminal)
+# 5. Levantar workers y servicios (cada uno en una terminal)
 npm run start:worker:platform   # Terminal 1 — Platform Worker (task queue: payments-platform)
 npm run start:worker:bill       # Terminal 2 — Bill Worker (task queue: payments-bill)
 npm run start:worker:p2p        # Terminal 3 — P2P Worker (task queue: payments-p2p)
@@ -396,18 +392,18 @@ curl -s "http://localhost:3000/workflows/{WORKFLOW_ID}/query/progress" | jq .
 
 ---
 
-### Flujo 5: Search Attributes
+### Flujo 5: Buscar workflows
 
 ```bash
-# Buscar todos los workflows de un usuario
-curl -s "http://localhost:3000/workflows/search?userId=user-001" | jq '.count, .workflows[].workflowId'
+# Buscar por tipo de workflow
+curl -s "http://localhost:3000/workflows/search?workflowType=billPaymentWorkflow" | jq '.count, .workflows[].workflowId'
 
-# Buscar por tipo
-curl -s "http://localhost:3000/workflows/search?subscriptionType=P2P" | jq '.count'
+# Buscar por estado
+curl -s "http://localhost:3000/workflows/search?status=Running" | jq '.count'
 
 # También desde Temporal CLI:
-temporal workflow list -q 'userId="user-001"'
-temporal workflow list -q 'subscriptionType="P2P" AND ExecutionStatus="Running"'
+temporal workflow list -q 'WorkflowType="recurringPaymentWorkflow"'
+temporal workflow list -q 'ExecutionStatus="Running"'
 ```
 
 ---
@@ -417,7 +413,6 @@ temporal workflow list -q 'subscriptionType="P2P" AND ExecutionStatus="Running"'
 Abre http://localhost:8233 para ver:
 - Historial completo de cada workflow (activities, timers, signals)
 - Child workflows y su relación con el parent
-- Search Attributes como filtros
 - Workflows cancelados vs completados
 
 ---
@@ -532,20 +527,17 @@ Respuesta:
 curl http://localhost:3000/workflows/recurring-{subscriptionId}-2026-07-08/query/status | jq
 ```
 
-### Search: Buscar workflows por atributos
+### Search: Buscar workflows por tipo y estado
 
 ```bash
-# Buscar todos los workflows de un usuario
-curl "http://localhost:3000/workflows/search?userId=user-001" | jq
-
-# Buscar por tipo de pago
-curl "http://localhost:3000/workflows/search?subscriptionType=P2P" | jq
+# Buscar por tipo de workflow
+curl "http://localhost:3000/workflows/search?workflowType=billPaymentWorkflow" | jq
 
 # Buscar por estado
 curl "http://localhost:3000/workflows/search?status=Running" | jq
 
 # También funciona directamente con Temporal CLI:
-temporal workflow list -q 'userId="user-001" AND subscriptionType="BILL"'
+temporal workflow list -q 'WorkflowType="recurringPaymentWorkflow" AND ExecutionStatus="Running"'
 ```
 
 
@@ -577,11 +569,9 @@ src/
 └── workflows/
     ├── index.ts               # Exports de workflows
     ├── recurring-payment.workflow.ts  # Parent: validate → strategy → child → record
-    │                                  #   + Search Attributes + Query: getExecutionStatus
+    │                                  #   + Query: getExecutionStatus
     ├── bill-payment.workflow.ts       # Child BILL: charge con retries + Signal + Query
     └── p2p-payment.workflow.ts        # Child P2P: wallet transfer con retries + cancellation
-scripts/
-└── register-search-attributes.sh    # Registra userId/subscriptionType en Temporal
 ```
 
 ---
@@ -657,11 +647,11 @@ Transactional outbox para notificaciones al usuario.
 | Servicios | Monolito (todo en un proceso) | Microservicios separados por dominio |
 | Outbox consumer | Polling + console.log | CDC/Debezium → Kafka → N consumers |
 | Signals | Via API REST endpoint | Via Temporal client SDK directo |
-| Search Attributes | userId, subscriptionType | + customerId, billerId, amount range, region |
+| Search Attributes | No usados en PoC | userId, customerId, billerId, subscriptionType, amount range, region |
 
 ---
 
-## Signals, Queries y Search Attributes
+## Signals y Queries
 
 ### Signals — Modificar workflows en ejecución
 
@@ -695,19 +685,7 @@ curl http://localhost:3000/workflows/{wfId}/query/progress
 
 **Caso de uso:** Dashboard de ops muestra estado real-time de cada cobro sin consultar la BD.
 
-### Search Attributes — Buscar workflows masivamente
-
-Cada workflow publica `userId` y `subscriptionType` como Search Attributes indexados:
-
-```bash
-# "Dame todos los workflows activos del usuario X"
-temporal workflow list -q 'userId="user-001" AND ExecutionStatus="Running"'
-
-# "¿Cuántos cobros P2P se ejecutaron hoy?"
-temporal workflow list -q 'subscriptionType="P2P" AND StartTime > "2026-07-08"'
-```
-
-**Caso de uso:** Soporte busca "todos los pagos del usuario 12345" sin escanear la BD.
+> **Nota:** En producción se recomienda agregar [Search Attributes](https://docs.temporal.io/visibility#search-attribute) (`userId`, `subscriptionType`, etc.) para buscar workflows por datos de negocio. Se omitieron en este PoC por simplicidad.
 
 ---
 
