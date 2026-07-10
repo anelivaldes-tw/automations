@@ -111,6 +111,7 @@ export async function scheduleRetry(subscriptionId: string): Promise<void> {
 export async function publishPlatformEvent(input: {
   subscriptionId: string;
   eventType: string;
+  topic?: string;
   idempotencyKey?: string;
   payload: Record<string, unknown>;
 }): Promise<void> {
@@ -125,6 +126,6 @@ export async function publishPlatformEvent(input: {
     publishedAt: new Date().toISOString(),
   };
 
-  await publishEvent(input.subscriptionId, message);
-  console.log(`[Platform→Kafka] 📤 ${input.eventType} | sub: ${input.subscriptionId} | key: ${idempotencyKey}`);
+  await publishEvent(input.subscriptionId, message, input.topic);
+  console.log(`[Platform→Kafka] 📤 ${input.eventType} | sub: ${input.subscriptionId} | topic: ${input.topic || 'notifications'} | key: ${idempotencyKey}`);
 }

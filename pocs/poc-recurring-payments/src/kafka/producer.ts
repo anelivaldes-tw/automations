@@ -21,12 +21,12 @@ export async function connectProducer(): Promise<void> {
   console.log(`🔌 Kafka producer connected → broker: ${BROKER}, topic: ${TOPIC} (idempotent: true)`);
 }
 
-export async function publishEvent(key: string, value: object): Promise<void> {
+export async function publishEvent(key: string, value: object, topic?: string): Promise<void> {
   if (!connected) {
     throw new Error('Kafka producer not connected. Call connectProducer() at worker startup.');
   }
   await producer.send({
-    topic: TOPIC,
+    topic: topic || TOPIC,
     messages: [
       {
         key,

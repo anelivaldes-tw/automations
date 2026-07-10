@@ -43,7 +43,11 @@ export interface PaymentExecutionInput {
   amount: number;
   maxRetries: number;
   userId?: string;
-  publishResult?: boolean; // If true, platform publishes final result to Kafka
+  eventConfig?: {
+    enabled: boolean;
+    topic?: string;           // Override del tópico (default: 'notifications')
+    includeAmount?: boolean;  // PCI: si incluir monto en el evento (default: true)
+  };
   metadata: Record<string, unknown>;
 }
 
@@ -106,11 +110,13 @@ export async function recurringPaymentWorkflow(input: PaymentExecutionInput): Pr
   }
 
   // Activity 5: Optionally publish final result to Kafka (platform-level event)
-  if (input.publishResult) {
+  if (input.eventConfig?.enabled) {
     const eventType = result === 'SUCCESS' ? 'PAYMENT_COMPLETED' : result === 'FAILED' ? 'PAYMENT_EXHAUSTED' : 'PAYMENT_SKIPPED';
+    const includeAmount = input.eventConfig.includeAmount !== false; // default true
     await publishPlatformEvent({
       subscriptionId: input.subscriptionId,
       eventType,
+      topic: input.eventConfig.topic,
       idempotencyKey: `${input.subscriptionId}-${input.executionDate}-platform-${eventType}`,
       payload: {
         subscriptionId: input.subscriptionId,
@@ -118,7 +124,7 @@ export async function recurringPaymentWorkflow(input: PaymentExecutionInput): Pr
         executionDate: input.executionDate,
         result,
         attemptCount,
-        amount: input.amount,
+        ...(includeAmount && { amount: input.amount }),
         destinationId: input.destinationId,
         durationMs: childResult?.durationMs ?? null,
       },
