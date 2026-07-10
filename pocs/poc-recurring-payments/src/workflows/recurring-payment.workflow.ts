@@ -77,8 +77,9 @@ export async function recurringPaymentWorkflow(input: PaymentExecutionInput): Pr
 
   let result: string;
   let attemptCount = 0;
+  let childResult: any;
   try {
-    const childResult = await executeChild(strategy.workflowName, {
+    childResult = await executeChild(strategy.workflowName, {
       args: [input],
       taskQueue: strategy.taskQueue,
       workflowId: `${input.subscriptionId}-${input.executionDate}-${input.subscriptionType}`,
@@ -119,6 +120,7 @@ export async function recurringPaymentWorkflow(input: PaymentExecutionInput): Pr
         attemptCount,
         amount: input.amount,
         destinationId: input.destinationId,
+        childExecution: childResult || null,
       },
     });
   }

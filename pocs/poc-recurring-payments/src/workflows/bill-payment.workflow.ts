@@ -37,19 +37,36 @@ export const getProgressQuery = defineQuery<{
   lastAttemptResult?: string;
 }>('getProgress');
 
+export interface AttemptDetail {
+  attempt: number;
+  result: 'SUCCESS' | 'FAILED';
+  timestamp: string;
+}
+
 export interface BillPaymentResult {
   status: 'SUCCESS' | 'FAILED' | 'CANCELLED';
   attemptCount: number;
+  maxAttempts: number;
+  finalAmount: number;
+  destinationId: string;
+  attempts: AttemptDetail[];
+  failureReason?: string;
+  startedAt: string;
+  completedAt: string;
+  durationMs: number;
 }
 
 export async function billPaymentWorkflow(input: PaymentExecutionInput): Promise<BillPaymentResult> {
   const maxAttempts = input.maxRetries || 3;
+  const startedAt = new Date().toISOString();
+  const attempts: AttemptDetail[] = [];
 
   // Mutable state (Signals can modify these)
   let currentAmount = input.amount;
   let currentAttempt = 0;
   let status: 'RUNNING' | 'WAITING_RETRY' | 'COMPLETED' = 'RUNNING';
   let lastAttemptResult: string | undefined;
+  let failureReason: string | undefined;
 
   // Register Signal handler: allows changing amount mid-flight (e.g., partial payment)
   setHandler(updateAmountSignal, (newAmount: number) => {
@@ -72,13 +89,26 @@ export async function billPaymentWorkflow(input: PaymentExecutionInput): Promise
   const valid = await activities.validateBiller(input.destinationId);
   if (!valid) {
     status = 'COMPLETED';
+    failureReason = 'INVALID_BILLER';
     await publishBillEvent({
       subscriptionId: input.subscriptionId,
       eventType: 'PAYMENT_FAILED',
       idempotencyKey: `${input.subscriptionId}-${input.executionDate}-INVALID_BILLER`,
       payload: { reason: 'INVALID_BILLER', destinationId: input.destinationId },
     });
-    return { status: 'FAILED', attemptCount: 0 };
+    const completedAt = new Date().toISOString();
+    return {
+      status: 'FAILED',
+      attemptCount: 0,
+      maxAttempts,
+      finalAmount: currentAmount,
+      destinationId: input.destinationId,
+      attempts: [],
+      failureReason,
+      startedAt,
+      completedAt,
+      durationMs: new Date(completedAt).getTime() - new Date(startedAt).getTime(),
+    };
   }
 
   // Step 2: Execute charge with retries (cancellation-aware)
@@ -90,6 +120,7 @@ export async function billPaymentWorkflow(input: PaymentExecutionInput): Promise
     try {
       const chargeResult = await activities.executeCharge(currentAmount, input.destinationId);
       lastAttemptResult = chargeResult;
+      attempts.push({ attempt, result: chargeResult === 'SUCCESS' ? 'SUCCESS' : 'FAILED', timestamp: new Date().toISOString() });
 
       if (chargeResult === 'SUCCESS') {
         console.log(`[BillPayment] ✅ Success on attempt ${attempt}`);
@@ -101,7 +132,18 @@ export async function billPaymentWorkflow(input: PaymentExecutionInput): Promise
           idempotencyKey: `${input.subscriptionId}-${input.executionDate}-SUCCESS-attempt${attempt}`,
           payload: { amount: currentAmount, attempt, destinationId: input.destinationId },
         });
-        return { status: 'SUCCESS', attemptCount: attempt };
+        const completedAt = new Date().toISOString();
+        return {
+          status: 'SUCCESS',
+          attemptCount: attempt,
+          maxAttempts,
+          finalAmount: currentAmount,
+          destinationId: input.destinationId,
+          attempts,
+          startedAt,
+          completedAt,
+          durationMs: new Date(completedAt).getTime() - new Date(startedAt).getTime(),
+        };
       }
 
       // Failed — notify user via Kafka and retry
@@ -126,7 +168,19 @@ export async function billPaymentWorkflow(input: PaymentExecutionInput): Promise
       if (isCancellation(err)) {
         console.log(`[BillPayment] 🚫 Cancelled during attempt ${attempt}`);
         status = 'COMPLETED';
-        return { status: 'CANCELLED', attemptCount: attempt };
+        const completedAt = new Date().toISOString();
+        return {
+          status: 'CANCELLED',
+          attemptCount: attempt,
+          maxAttempts,
+          finalAmount: currentAmount,
+          destinationId: input.destinationId,
+          attempts,
+          failureReason: 'USER_CANCELLED',
+          startedAt,
+          completedAt,
+          durationMs: new Date(completedAt).getTime() - new Date(startedAt).getTime(),
+        };
       }
       throw err;
     }
@@ -134,6 +188,7 @@ export async function billPaymentWorkflow(input: PaymentExecutionInput): Promise
 
   console.log(`[BillPayment] ❌ All ${maxAttempts} attempts exhausted`);
   status = 'COMPLETED';
+  failureReason = 'MAX_ATTEMPTS_EXHAUSTED';
   // Notify final failure to Kafka
   await publishBillEvent({
     subscriptionId: input.subscriptionId,
@@ -141,5 +196,17 @@ export async function billPaymentWorkflow(input: PaymentExecutionInput): Promise
     idempotencyKey: `${input.subscriptionId}-${input.executionDate}-PAYMENT_FAILED`,
     payload: { amount: currentAmount, attempts: maxAttempts, destinationId: input.destinationId },
   });
-  return { status: 'FAILED', attemptCount: maxAttempts };
+  const completedAt = new Date().toISOString();
+  return {
+    status: 'FAILED',
+    attemptCount: maxAttempts,
+    maxAttempts,
+    finalAmount: currentAmount,
+    destinationId: input.destinationId,
+    attempts,
+    failureReason,
+    startedAt,
+    completedAt,
+    durationMs: new Date(completedAt).getTime() - new Date(startedAt).getTime(),
+  };
 }
