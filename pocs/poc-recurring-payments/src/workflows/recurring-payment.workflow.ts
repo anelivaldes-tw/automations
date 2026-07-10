@@ -2,10 +2,21 @@ import { proxyActivities, executeChild, defineQuery, setHandler } from '@tempora
 import { ChildWorkflowCancellationType } from '@temporalio/workflow';
 import type * as activities from '../activities';
 
-// Proxy activities for the platform worker
+// Platform activities (DB operations)
 const { validateSubscription, recordPaymentResult, scheduleRetry } = proxyActivities<typeof activities>({
   startToCloseTimeout: '30s',
   retry: { maximumAttempts: 3 },
+});
+
+// Kafka publish activity — separate retry policy for resilience
+const { publishPlatformEvent } = proxyActivities<typeof activities>({
+  startToCloseTimeout: '10s',
+  retry: {
+    maximumAttempts: 5,
+    initialInterval: '1s',
+    backoffCoefficient: 2,
+    maximumInterval: '30s',
+  },
 });
 
 // Strategy Resolver — maps subscription_type to child workflow + task queue
@@ -32,6 +43,7 @@ export interface PaymentExecutionInput {
   amount: number;
   maxRetries: number;
   userId?: string;
+  publishResult?: boolean; // If true, platform publishes final result to Kafka
   metadata: Record<string, unknown>;
 }
 
@@ -90,6 +102,25 @@ export async function recurringPaymentWorkflow(input: PaymentExecutionInput): Pr
   // Activity 4: Schedule retry if all attempts exhausted (not for cancelled)
   if (result === 'FAILED') {
     await scheduleRetry(input.subscriptionId);
+  }
+
+  // Activity 5: Optionally publish final result to Kafka (platform-level event)
+  if (input.publishResult) {
+    const eventType = result === 'SUCCESS' ? 'PAYMENT_COMPLETED' : result === 'FAILED' ? 'PAYMENT_EXHAUSTED' : 'PAYMENT_SKIPPED';
+    await publishPlatformEvent({
+      subscriptionId: input.subscriptionId,
+      eventType,
+      idempotencyKey: `${input.subscriptionId}-${input.executionDate}-platform-${eventType}`,
+      payload: {
+        subscriptionId: input.subscriptionId,
+        subscriptionType: input.subscriptionType,
+        executionDate: input.executionDate,
+        result,
+        attemptCount,
+        amount: input.amount,
+        destinationId: input.destinationId,
+      },
+    });
   }
 
   finalResult = result;

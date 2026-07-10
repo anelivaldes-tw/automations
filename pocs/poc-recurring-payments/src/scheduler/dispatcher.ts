@@ -54,6 +54,7 @@ async function dispatch() {
               amount: parseFloat(sub.amount),
               maxRetries: sub.max_retries,
               userId: sub.user_id,
+              publishResult: true,
               metadata: {},
             }],
             taskQueue: 'payments-platform',
