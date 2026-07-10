@@ -120,7 +120,7 @@ export async function recurringPaymentWorkflow(input: PaymentExecutionInput): Pr
         attemptCount,
         amount: input.amount,
         destinationId: input.destinationId,
-        childExecution: childResult || null,
+        durationMs: childResult?.durationMs ?? null,
       },
     });
   }
